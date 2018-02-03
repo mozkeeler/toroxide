@@ -1,0 +1,7 @@
+[package]
+name = "tor-parse"
+version = "0.1.0"
+authors = ["D Keeler <mozkeeler@gmail.com>"]
+
+[dependencies]
+hex = "0.3.1"

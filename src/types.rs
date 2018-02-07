@@ -387,8 +387,8 @@ const NTOR_SERVER_HANDSHAKE_SIZE: usize = 64;
 
 #[derive(Debug)]
 pub struct NtorServerHandshake {
-    server_pk: [u8; 32],
-    auth: [u8; 32],
+    pub server_pk: [u8; 32],
+    pub auth: [u8; 32],
 }
 
 impl NtorServerHandshake {

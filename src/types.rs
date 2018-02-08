@@ -1,3 +1,4 @@
+use std::fmt;
 use std::str;
 
 const PAYLOAD_LEN: usize = 509;
@@ -206,7 +207,6 @@ impl NetinfoCell {
     }
 }
 
-#[derive(Debug)]
 pub struct RelayCell<'a> {
     relay_command: RelayCommand,
     recognized: u16,
@@ -259,22 +259,38 @@ impl RelayCommand {
     }
 }
 
+pub enum RelayCellError {
+    Unrecognized,
+    InsufficientLength,
+    InsufficientPayloadLength,
+}
+
 impl<'a> RelayCell<'a> {
-    pub fn from_slice(bytes: &[u8]) -> Result<RelayCell, &'static str> {
+    // Maybe pass expected digest here so we can validate that too?
+    // (as is this can erroneously be "recognized" 1/256^2 of the time)
+    pub fn from_slice(bytes: &[u8]) -> Result<RelayCell, RelayCellError> {
         if bytes.len() < PAYLOAD_LEN {
-            return Err("input not long enough for RelayCell");
+            return Err(RelayCellError::InsufficientLength);
         }
         let relay_command = RelayCommand::from_u8(bytes[0]);
         // TODO: not this
         let recognized = ((bytes[1] as u16) << 8) + (bytes[2] as u16);
-        let stream_id = ((bytes[3] as u16) << 8) + (bytes[4] as u16);
-        let digest = ((bytes[6] as u32) << 24) + ((bytes[7] as u32) << 16)
-            + ((bytes[8] as u32) << 8) + (bytes[9] as u32); // endian-ness?
-        let length = ((bytes[10] as u16) << 8) + (bytes[11] as u16);
-        if length as usize > PAYLOAD_LEN - 11 {
-            return Err("indicated data length too long");
+        if recognized != 0 as u16 {
+            return Err(RelayCellError::Unrecognized);
         }
-        let data = &bytes[11..11 + length as usize];
+        let stream_id = ((bytes[3] as u16) << 8) + (bytes[4] as u16);
+        // endian-ness?
+        let digest = ((bytes[6] as u32) << 24) + ((bytes[7] as u32) << 16)
+            + ((bytes[8] as u32) << 8) + (bytes[9] as u32);
+        // This isn't making much sense to me. For DATA cells, the length field doesn't seem to
+        // correspond to... anything?
+        let length = ((bytes[10] as u16) << 8) + (bytes[11] as u16);
+        let data_length = if length < (PAYLOAD_LEN - 11) as u16 {
+            length
+        } else {
+            (PAYLOAD_LEN - 11) as u16
+        };
+        let data = &bytes[11..11 + data_length as usize];
         Ok(RelayCell {
             relay_command: relay_command,
             recognized: recognized,
@@ -283,6 +299,20 @@ impl<'a> RelayCell<'a> {
             length: length,
             data: data,
         })
+    }
+}
+
+impl<'a> fmt::Display for RelayCell<'a> {
+    fn fmt(&self, dest: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            dest,
+            "RelayCell {{ {:?} {} {} {} {} ",
+            self.relay_command, self.recognized, self.stream_id, self.digest, self.length
+        )?;
+        for b in self.data {
+            write!(dest, "{:02x}", b)?;
+        }
+        write!(dest, " }}")
     }
 }
 

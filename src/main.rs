@@ -1,3 +1,4 @@
+extern crate constant_time_eq;
 extern crate crypto;
 extern crate curve25519_dalek;
 extern crate hex;
@@ -6,6 +7,7 @@ extern crate sha2;
 
 mod types;
 
+use constant_time_eq::constant_time_eq;
 use crypto::{aes, symmetriccipher};
 use curve25519_dalek::montgomery;
 use curve25519_dalek::scalar;
@@ -38,8 +40,6 @@ struct NtorContext {
 }
 
 struct AesContext {
-    iv: [u8; 16],
-    key: [u8; 16],
     aes: Box<symmetriccipher::SynchronousStreamCipher + 'static>,
 }
 
@@ -48,8 +48,6 @@ impl AesContext {
         let iv: [u8; 16] = [0; 16];
         let key: [u8; 16] = slice_to_16_byte_array(key);
         AesContext {
-            iv: iv,
-            key: key,
             aes: aes::ctr(aes::KeySize::KeySize128, &key, &iv),
         }
     }
@@ -90,13 +88,18 @@ fn main() {
     }
 }
 
+enum Direction {
+    Incoming,
+    Outgoing,
+}
+
 impl TorClient {
     fn handle_event(&mut self, event: &String) {
         let parts: Vec<_> = event.split(":").collect();
         match parts[0] {
             "keygen" => self.decode_keygen(&parts[1..]),
-            "read" => self.decode_cell(parts[1]),
-            "write" => self.decode_cell(parts[1]),
+            "read" => self.decode_cell(Direction::Incoming, parts[1]),
+            "write" => self.decode_cell(Direction::Outgoing, parts[1]),
             _ => println!("unknown operation {}", parts[0]),
         }
     }
@@ -110,14 +113,14 @@ impl TorClient {
         });
     }
 
-    fn decode_cell(&mut self, cell_hex: &str) {
+    fn decode_cell(&mut self, direction: Direction, cell_hex: &str) {
         let bytes = hex::decode(cell_hex).unwrap();
         let tor_cell = types::Cell::from_slice(&bytes).unwrap();
         println!("{:?}", tor_cell);
         match tor_cell.command {
             types::Command::Relay => {
-                self.handle_relay_cell(tor_cell.circ_id, tor_cell.payload);
-            },
+                self.handle_encrypted_relay_cell(tor_cell.circ_id, direction, tor_cell.payload);
+            }
             types::Command::Netinfo => match types::NetinfoCell::from_slice(tor_cell.payload) {
                 Ok(netinfo_cell) => {
                     println!("{:?}", netinfo_cell);
@@ -133,25 +136,23 @@ impl TorClient {
                             types::NtorClientHandshake::from_slice(create2_cell.h_data).unwrap();
                         println!("{:?}", client_handshake);
                         if let Some(pending_ntor_context) = self.pending_ntor_context.take() {
-                            self.ntor_contexts.insert(tor_cell.circ_id, pending_ntor_context);
+                            self.ntor_contexts
+                                .insert(tor_cell.circ_id, pending_ntor_context);
                         }
                     }
                     Err(msg) => println!("{}", msg),
                 }
             }
-            types::Command::Created2 => {
-                match types::Created2Cell::from_slice(tor_cell.payload) {
-                    Ok(created2_cell) => self.do_ntor_handshake(tor_cell.circ_id, &created2_cell),
-                    Err(msg) => println!("{}", msg),
-                }
-            }
+            types::Command::Created2 => match types::Created2Cell::from_slice(tor_cell.payload) {
+                Ok(created2_cell) => self.do_ntor_handshake(tor_cell.circ_id, &created2_cell),
+                Err(msg) => println!("{}", msg),
+            },
             _ => {}
         }
     }
 
-#[allow(non_snake_case)]
-    fn do_ntor_handshake(&mut self, circ_id: u32, created2_cell: &types::Created2Cell)
-    {
+    #[allow(non_snake_case)]
+    fn do_ntor_handshake(&mut self, circ_id: u32, created2_cell: &types::Created2Cell) {
         if let Some(ref ntor_context) = self.ntor_contexts.get(&circ_id) {
             println!("{:?}", created2_cell);
             // technically we should check the corresponding create2_cell type here
@@ -181,30 +182,56 @@ impl TorClient {
             auth_input.extend("ntor-curve25519-sha256-1".as_bytes());
             auth_input.extend("Server".as_bytes());
             let calculated_auth = ntor_hmac(&auth_input, b"ntor-curve25519-sha256-1:mac");
-            println!("calculated auth");
-            hexdump(&calculated_auth);
-            println!("server's auath");
-            hexdump(&server_handshake.auth);
-            // TODO: compare those (constant-time)
-            // so this is actually the prk in the kdf... (confusing documentation)
-            let key_seed = ntor_hmac(&secret_input, b"ntor-curve25519-sha256-1:key_extract");
-            let ntor_keys = compute_ntor_keys(&key_seed);
-            self.ntor_keys.insert(circ_id, ntor_keys);
+            if constant_time_eq(&calculated_auth, &server_handshake.auth) {
+                // so this is actually the prk in the kdf... (confusing documentation)
+                let key_seed = ntor_hmac(&secret_input, b"ntor-curve25519-sha256-1:key_extract");
+                let ntor_keys = compute_ntor_keys(&key_seed);
+                self.ntor_keys.insert(circ_id, ntor_keys);
+            }
         }
     }
 
-    fn handle_relay_cell(&mut self, circ_id: u32, encrypted_relay_cell: &[u8]) {
-        if let Some(ref mut ntor_keys) = self.ntor_keys.get_mut(&circ_id) {
+    fn handle_encrypted_relay_cell(
+        &mut self,
+        circ_id: u32,
+        direction: Direction,
+        encrypted_relay_cell: &[u8],
+    ) {
+        let bytes = if let Some(ref mut ntor_keys) = self.ntor_keys.get_mut(&circ_id) {
             let mut decrypted_relay_cell: Vec<u8> = Vec::with_capacity(encrypted_relay_cell.len());
             decrypted_relay_cell.resize(encrypted_relay_cell.len(), 0);
             // So we have to have some way to roll back things that weren't actually for us (or
             // attacks that would attempt to modify our counter...)
-            ntor_keys.backward_key.aes.process(encrypted_relay_cell, &mut decrypted_relay_cell);
-            match types::RelayCell::from_slice(&decrypted_relay_cell) {
-                Ok(relay_cell) => println!("{:?}", relay_cell),
-                Err(msg) => println!("{}", msg),
-            }
-        }
+            // It seems the canonical implementation just kills the connection if this ever happens.
+            let aes_context = match direction {
+                Direction::Incoming => &mut ntor_keys.backward_key,
+                Direction::Outgoing => &mut ntor_keys.forward_key,
+            };
+            aes_context
+                .aes
+                .process(encrypted_relay_cell, &mut decrypted_relay_cell);
+            decrypted_relay_cell
+        } else {
+            return;
+        };
+        match types::RelayCell::from_slice(&bytes) {
+            Ok(relay_cell) => self.handle_relay_cell(circ_id, direction, relay_cell),
+            Err(err) => match err {
+                types::RelayCellError::Unrecognized => {
+                    println!("that cell wasn't for us? (need to decrypt again?)")
+                }
+                types::RelayCellError::InsufficientLength => {
+                    println!("didn't even have PAYLOAD_LEN bytes? (shouldn't happen)")
+                }
+                types::RelayCellError::InsufficientPayloadLength => {
+                    println!("cell not long internally (error?)")
+                }
+            },
+        };
+    }
+
+    fn handle_relay_cell(&self, circ_id: u32, direction: Direction, relay_cell: types::RelayCell) {
+        println!("{}", relay_cell);
     }
 }
 
@@ -263,17 +290,23 @@ fn compute_ntor_keys(key_seed: &[u8]) -> NtorKeys {
     // K(2) = HMAC-SHA256(K(1) | m_expand | 0x02 as u8, key_seed)
     // K(2) = HMAC-SHA256(K(2) | m_expand | 0x03 as u8, key_seed)
     let mut m_expand_1: Vec<u8> = Vec::new();
-    m_expand_1.write_all(b"ntor-curve25519-sha256-1:key_expand").unwrap();
+    m_expand_1
+        .write_all(b"ntor-curve25519-sha256-1:key_expand")
+        .unwrap();
     m_expand_1.push(1);
     let k_1 = ntor_hmac(&m_expand_1, key_seed);
     let mut m_expand_2: Vec<u8> = Vec::new();
     m_expand_2.write_all(&k_1).unwrap();
-    m_expand_2.write_all(b"ntor-curve25519-sha256-1:key_expand").unwrap();
+    m_expand_2
+        .write_all(b"ntor-curve25519-sha256-1:key_expand")
+        .unwrap();
     m_expand_2.push(2);
     let k_2 = ntor_hmac(&m_expand_2, key_seed);
     let mut m_expand_3: Vec<u8> = Vec::new();
     m_expand_3.write_all(&k_2).unwrap();
-    m_expand_3.write_all(b"ntor-curve25519-sha256-1:key_expand").unwrap();
+    m_expand_3
+        .write_all(b"ntor-curve25519-sha256-1:key_expand")
+        .unwrap();
     m_expand_3.push(3);
     let k_3 = ntor_hmac(&m_expand_3, key_seed);
     let mut k: Vec<u8> = Vec::new();

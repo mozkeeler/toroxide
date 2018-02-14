@@ -1,19 +1,28 @@
+extern crate base64;
 extern crate constant_time_eq;
 extern crate crypto;
 extern crate curve25519_dalek;
+extern crate curl;
+extern crate getopts;
 extern crate hex;
 extern crate hmac;
+extern crate openssl;
 extern crate sha2;
 
+mod tls;
 mod types;
+mod util;
+mod dir;
 
 use constant_time_eq::constant_time_eq;
 use crypto::{aes, symmetriccipher};
 use curve25519_dalek::montgomery;
 use curve25519_dalek::scalar;
+use getopts::Options;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::env;
 use std::io::prelude::*;
 use std::io;
 use std::ops::Mul;
@@ -72,7 +81,35 @@ impl NtorKeys {
     }
 }
 
+fn print_usage(program: &str, opts: Options) {
+    let brief = format!("Usage: {} [options]", program);
+    print!("{}", opts.usage(&brief));
+}
+
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    let program = &args[0];
+    let mut opts = Options::new();
+    opts.optflag("d", "dump", "dump debug output from another Tor client");
+    opts.optflag("h", "help", "display this help message");
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(e) => panic!(e),
+    };
+    if matches.opt_present("h") {
+        print_usage(program, opts);
+        return;
+    }
+    if matches.opt_present("d") {
+        debug_dump_from_stdin();
+        return;
+    }
+
+    let peer = &dir::get_tor_peers()[0];
+    let connection = tls::TlsConnection::new(&peer);
+}
+
+fn debug_dump_from_stdin() {
     let mut tor_client = TorClient {
         ntor_contexts: HashMap::new(),
         pending_ntor_context: None,
@@ -107,9 +144,9 @@ impl TorClient {
     fn decode_keygen(&mut self, keys_hex: &[&str]) {
         self.pending_ntor_context = Some(NtorContext {
             router_id: slice_to_20_byte_array(&hex::decode(keys_hex[0]).unwrap()),
-            client_B: slice_to_32_byte_array(&hex::decode(keys_hex[1]).unwrap()),
-            client_X: slice_to_32_byte_array(&hex::decode(keys_hex[2]).unwrap()),
-            client_x: slice_to_32_byte_array(&hex::decode(keys_hex[3]).unwrap()),
+            client_B: util::slice_to_32_byte_array(&hex::decode(keys_hex[1]).unwrap()),
+            client_X: util::slice_to_32_byte_array(&hex::decode(keys_hex[2]).unwrap()),
+            client_x: util::slice_to_32_byte_array(&hex::decode(keys_hex[3]).unwrap()),
         });
     }
 
@@ -248,21 +285,8 @@ fn slice_to_20_byte_array(bytes: &[u8]) -> [u8; 20] {
     fixed_size
 }
 
-fn slice_to_32_byte_array(bytes: &[u8]) -> [u8; 32] {
-    let mut fixed_size: [u8; 32] = [0; 32];
-    fixed_size.copy_from_slice(&bytes);
-    fixed_size
-}
-
 fn curve25519_multiply(x: &montgomery::CompressedMontgomeryU, s: &scalar::Scalar) -> [u8; 32] {
     x.decompress().mul(s).compress().to_bytes()
-}
-
-fn hexdump(bytes: &[u8]) {
-    for b in bytes {
-        print!("{:02x}", b);
-    }
-    println!();
 }
 
 fn ntor_hmac(input: &[u8], context: &[u8]) -> Vec<u8> {

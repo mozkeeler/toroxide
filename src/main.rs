@@ -209,6 +209,10 @@ impl TorClient {
                 Ok(created2_cell) => self.do_ntor_handshake(tor_cell.circ_id, &created2_cell),
                 Err(msg) => println!("{}", msg),
             },
+            types::Command::Certs => match types::CertsCell::read_new(&mut &tor_cell.payload[..]) {
+                Ok(certs_cell) => println!("{:?}", certs_cell),
+                Err(msg) => println!("{}", msg),
+            },
             _ => {}
         }
     }

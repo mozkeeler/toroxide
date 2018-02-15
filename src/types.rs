@@ -26,6 +26,12 @@ pub enum Command {
     Create2,
     Created2,
     PaddingNegotiate,
+    // Versions is handled separately
+    VPadding,
+    Certs,
+    AuthChallenge,
+    Authenticate,
+    Authorize,
     Unknown(u8),
 }
 
@@ -44,7 +50,22 @@ impl Command {
             10 => Command::Create2,
             11 => Command::Created2,
             12 => Command::PaddingNegotiate,
+            // variable-length commands:
+            // 7 => Command::Versions is handled separately
+            128 => Command::VPadding,
+            129 => Command::Certs,
+            130 => Command::AuthChallenge,
+            131 => Command::Authenticate,
+            132 => Command::Authorize,
             _ => Command::Unknown(command),
+        }
+    }
+
+    fn is_variable_length(&self) -> bool {
+        match *self {
+            Command::VPadding | Command::Certs | Command::AuthChallenge |
+            Command::Authenticate | Command::Authorize => true,
+            _ => false
         }
     }
 }
@@ -62,8 +83,17 @@ impl Cell {
             return Err("failed to read command");
         }
         let command = Command::from_u8(one_byte_buf[0]);
-        let mut payload: Vec<u8> = Vec::with_capacity(PAYLOAD_LEN);
-        payload.resize(PAYLOAD_LEN, 0);
+        let length = if command.is_variable_length() {
+            let mut two_byte_buf = [0; 2];
+            if let Err(_) = reader.read_exact(&mut two_byte_buf) {
+                return Err("failed to read variable cell length");
+            }
+            ((two_byte_buf[0] as usize) << 8) + two_byte_buf[1] as usize
+        } else {
+            PAYLOAD_LEN
+        };
+        let mut payload: Vec<u8> = Vec::with_capacity(length);
+        payload.resize(length, 0);
         if let Err(_) = reader.read_exact(payload.as_mut_slice()) {
             return Err("failed to read payload");
         }
@@ -72,6 +102,82 @@ impl Cell {
             command: command,
             payload: payload,
         })
+    }
+}
+
+#[derive(Debug)]
+pub enum CertType {
+    LinkKey,
+    RsaIdentity,
+    RsaAuthenticateCell,
+    Ed25519SigningKey,
+    TlsLink,
+    Ed25519AuthenticateCell,
+    Ed25519Identity,
+    Unknown(u8),
+}
+
+impl CertType {
+    fn from_utf8(cert_type: u8) -> CertType {
+        match cert_type {
+            1 => CertType::LinkKey,
+            2 => CertType::RsaIdentity,
+            3 => CertType::RsaAuthenticateCell,
+            4 => CertType::Ed25519SigningKey,
+            5 => CertType::TlsLink,
+            6 => CertType::Ed25519AuthenticateCell,
+            7 => CertType::Ed25519Identity,
+            _ => CertType::Unknown(cert_type),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Cert {
+    cert_type: CertType,
+    cert: Vec<u8>,
+}
+
+impl Cert {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<Cert, &'static str> {
+        let mut one_byte_buf = [0; 1];
+        if let Err(_) = reader.read_exact(&mut one_byte_buf) {
+            return Err("failed to read cert type");
+        }
+        let mut two_byte_buf = [0; 2];
+        if let Err(_) = reader.read_exact(&mut two_byte_buf) {
+            return Err("failed to read cert length");
+        }
+        let length = ((two_byte_buf[0] as usize) << 8) + two_byte_buf[1] as usize;
+        let mut cert = Cert {
+            cert_type: CertType::from_utf8(one_byte_buf[0]),
+            cert: Vec::with_capacity(length),
+        };
+        cert.cert.resize(length, 0);
+        if let Err(_) = reader.read_exact(cert.cert.as_mut_slice()) {
+            return Err("failed to read cert bytes");
+        }
+        Ok(cert)
+    }
+}
+
+#[derive(Debug)]
+pub struct CertsCell {
+    certs: Vec<Cert>,
+}
+
+impl CertsCell {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<CertsCell, &'static str> {
+        let mut one_byte_buf = [0; 1];
+        if let Err(_) = reader.read_exact(&mut one_byte_buf) {
+            return Err("failed to read number of certs");
+        }
+        let mut certs: Vec<Cert> = Vec::with_capacity(one_byte_buf[0] as usize);
+        for _ in 0..one_byte_buf[0] {
+            let cert = Cert::read_new(reader)?;
+            certs.push(cert);
+        }
+        Ok(CertsCell { certs: certs })
     }
 }
 
@@ -484,11 +590,11 @@ impl VersionsCell {
 
     pub fn read_new<R: Read>(reader: &mut R) -> Result<VersionsCell, &'static str> {
         let mut two_byte_buf = [0; 2];
-        let mut one_byte_buf = [0; 1];
         if let Err(_) = reader.read_exact(&mut two_byte_buf) {
             return Err("failed to read CircID");
         }
         // validate CircID == 0?
+        let mut one_byte_buf = [0; 1];
         if let Err(_) = reader.read_exact(&mut one_byte_buf) {
             return Err("failed to read command");
         }

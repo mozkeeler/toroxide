@@ -1,13 +1,15 @@
 use std::fmt;
 use std::str;
+use std::io::Read;
 
 const PAYLOAD_LEN: usize = 509;
+const CELL_LEN: usize = 514; // link protocol v4 is the only one supported at the moment
 
 #[derive(Debug)]
-pub struct Cell<'a> {
+pub struct Cell {
     pub circ_id: u32,
     pub command: Command,
-    pub payload: &'a [u8],
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -47,25 +49,28 @@ impl Command {
     }
 }
 
-impl<'a> Cell<'a> {
-    pub fn from_slice(bytes: &[u8]) -> Result<Cell, &'static str> {
-        // we'll need context here to know what version this actually is (assume 5 for now)
-        // we'll also want to user serde or something instead of hand-rolling this
-        if bytes.len() < 4 + 1 {
-            return Err("input not long enough");
+impl Cell {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<Cell, &'static str> {
+        let mut four_byte_buf: [u8; 4] = [0; 4];
+        if let Err(_) = reader.read_exact(&mut four_byte_buf) {
+            return Err("failed to read CircID");
         }
-        let circ_id = ((bytes[0] as u32) << 24) + ((bytes[1] as u32) << 16)
-            + ((bytes[2] as u32) << 8) + (bytes[3] as u32); // endian-ness?
-        let command = Command::from_u8(bytes[4]);
-        // length is only for variable-length commands
-        //let length = ((bytes[6] as u16) << 8) + (bytes[5] as u16); // XXX big-endian
-        if bytes.len() < 4 + 1 + PAYLOAD_LEN {
-            return Err("input not long enough for specified length");
+        let circ_id = ((four_byte_buf[0] as u32) << 24) + ((four_byte_buf[1] as u32) << 16)
+            + ((four_byte_buf[2] as u32) << 8) + (four_byte_buf[3] as u32); // endian-ness?
+        let mut one_byte_buf = [0; 1];
+        if let Err(_) = reader.read_exact(&mut one_byte_buf) {
+            return Err("failed to read command");
+        }
+        let command = Command::from_u8(one_byte_buf[0]);
+        let mut payload: Vec<u8> = Vec::with_capacity(PAYLOAD_LEN);
+        payload.resize(PAYLOAD_LEN, 0);
+        if let Err(_) = reader.read_exact(payload.as_mut_slice()) {
+            return Err("failed to read payload");
         }
         Ok(Cell {
             circ_id: circ_id,
             command: command,
-            payload: &bytes[4 + 1..4 + 1 + PAYLOAD_LEN as usize],
+            payload: payload,
         })
     }
 }
@@ -436,5 +441,96 @@ impl NtorServerHandshake {
             handshake.auth[i] = bytes[32 + i];
         }
         Ok(handshake)
+    }
+}
+
+#[derive(Debug)]
+pub struct VersionsCell {
+    // Technically they're 2 bytes on the wire, but since only versions 1-5 are defined, u8 works.
+    versions: Vec<u8>,
+}
+
+impl VersionsCell {
+    pub fn new(versions: Vec<u8>) -> VersionsCell {
+        // we really only support v3, 4, 5 (and we really don't do much validation...)
+        assert!(versions.len() < 3);
+        VersionsCell { versions: versions }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        // a VERSIONS cell is variable-length and has CIRCID_LEN equal to 2.
+        // Thus:
+        // CircID     [2 bytes]
+        // Command(7) [1 bytes]
+        // Length     [2 bytes]
+        // Payload    [Length bytes]
+        // (where the payload is a sequence of 2-byte big-endian version numbers)
+        let mut bytes: Vec<u8> = Vec::new();
+        // I think CircID is supposed to be 0, but it's unclear if that's specified.
+        bytes.push(0);
+        bytes.push(0);
+        // 7 is VERSIONS
+        bytes.push(7);
+        // Payload is 2 bytes.
+        bytes.push(0);
+        assert!(self.versions.len() < 128);
+        bytes.push((self.versions.len() * 2) as u8);
+        for version in &self.versions {
+            bytes.push(0);
+            bytes.push(*version);
+        }
+        bytes
+    }
+
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<VersionsCell, &'static str> {
+        let mut two_byte_buf = [0; 2];
+        let mut one_byte_buf = [0; 1];
+        if let Err(_) = reader.read_exact(&mut two_byte_buf) {
+            return Err("failed to read CircID");
+        }
+        // validate CircID == 0?
+        if let Err(_) = reader.read_exact(&mut one_byte_buf) {
+            return Err("failed to read command");
+        }
+        if one_byte_buf[0] != 7 {
+            return Err("expected VERSIONS");
+        }
+        if let Err(_) = reader.read_exact(&mut two_byte_buf) {
+            return Err("failed to read payload length");
+        }
+        if two_byte_buf[0] != 0 || two_byte_buf[1] > 6 {
+            return Err("unsupported number of versions");
+        }
+        if two_byte_buf[1] % 2 != 0 {
+            return Err("odd length VERSIONS payload");
+        }
+        let mut versions: Vec<u8> = Vec::new();
+        for _ in 0..two_byte_buf[1] / 2 {
+            if let Err(_) = reader.read_exact(&mut two_byte_buf) {
+                return Err("couldn't read version");
+            }
+            // check highest byte is 0
+            versions.push(two_byte_buf[1]);
+        }
+        Ok(VersionsCell { versions: versions })
+    }
+
+    /// tor-spec.txt, section 4:
+    /// Both parties MUST select as the link protocol version the highest number contained both in
+    /// the VERSIONS cell they sent and in the versions cell they received. If they have no such
+    /// version in common, they cannot communicate and MUST close the connection.
+    pub fn negotiate(&self, other: &VersionsCell) -> Result<u8, &'static str> {
+        let mut highest: u8 = 0;
+        for self_version in &self.versions {
+            if *self_version > highest && other.versions.contains(self_version) {
+                highest = *self_version;
+            }
+        }
+        // In reality we only support version 4 right now.
+        if highest == 4 {
+            Ok(highest)
+        } else {
+            Err("no shared versions")
+        }
     }
 }

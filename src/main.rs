@@ -26,6 +26,7 @@ use std::env;
 use std::io::prelude::*;
 use std::io;
 use std::ops::Mul;
+use std::{thread, time};
 
 struct TorClient {
     /// Map of circuit id to NtorContext
@@ -106,15 +107,26 @@ fn main() {
     }
 
     let peer = &dir::get_tor_peers()[0];
-    let connection = tls::TlsConnection::new(&peer);
+    println!("{:?}", peer);
+    let mut connection = tls::TlsConnection::new(&peer);
+    let versions = types::VersionsCell::new(vec![4]);
+    let data = versions.to_bytes();
+    match connection.write(&data) {
+        Ok(len) => println!("sent {}", len),
+        Err(e) => panic!(e),
+    };
+    let peer_versions = types::VersionsCell::read_new(&mut connection).unwrap();
+    let version = versions.negotiate(&peer_versions).unwrap();
+    let mut tor_client = TorClient::new();
+    println!("negotiated version {}", version);
+    loop {
+        tor_client.decode_input(Direction::Incoming, &mut connection);
+        thread::sleep(time::Duration::from_millis(1000));
+    }
 }
 
 fn debug_dump_from_stdin() {
-    let mut tor_client = TorClient {
-        ntor_contexts: HashMap::new(),
-        pending_ntor_context: None,
-        ntor_keys: HashMap::new(),
-    };
+    let mut tor_client = TorClient::new();
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line.unwrap();
@@ -125,18 +137,27 @@ fn debug_dump_from_stdin() {
     }
 }
 
+#[derive(Debug)]
 enum Direction {
     Incoming,
     Outgoing,
 }
 
 impl TorClient {
+    fn new() -> TorClient {
+        TorClient {
+            ntor_contexts: HashMap::new(),
+            pending_ntor_context: None,
+            ntor_keys: HashMap::new(),
+        }
+    }
+
     fn handle_event(&mut self, event: &String) {
         let parts: Vec<_> = event.split(":").collect();
         match parts[0] {
             "keygen" => self.decode_keygen(&parts[1..]),
-            "read" => self.decode_cell(Direction::Incoming, parts[1]),
-            "write" => self.decode_cell(Direction::Outgoing, parts[1]),
+            "read" => self.decode_cell_hex(Direction::Incoming, parts[1]),
+            "write" => self.decode_cell_hex(Direction::Outgoing, parts[1]),
             _ => println!("unknown operation {}", parts[0]),
         }
     }
@@ -150,22 +171,26 @@ impl TorClient {
         });
     }
 
-    fn decode_cell(&mut self, direction: Direction, cell_hex: &str) {
-        let bytes = hex::decode(cell_hex).unwrap();
-        let tor_cell = types::Cell::from_slice(&bytes).unwrap();
+    fn decode_cell_hex(&mut self, direction: Direction, cell_hex: &str) {
+        let mut bytes = &hex::decode(cell_hex).unwrap()[..];
+        self.decode_input(direction, &mut bytes);
+    }
+
+    fn decode_input<R: Read>(&mut self, direction: Direction, input: &mut R) {
+        let tor_cell = types::Cell::read_new(input).unwrap();
         println!("{:?}", tor_cell);
         match tor_cell.command {
             types::Command::Relay => {
-                self.handle_encrypted_relay_cell(tor_cell.circ_id, direction, tor_cell.payload);
+                self.handle_encrypted_relay_cell(tor_cell.circ_id, direction, &tor_cell.payload);
             }
-            types::Command::Netinfo => match types::NetinfoCell::from_slice(tor_cell.payload) {
+            types::Command::Netinfo => match types::NetinfoCell::from_slice(&tor_cell.payload) {
                 Ok(netinfo_cell) => {
                     println!("{:?}", netinfo_cell);
                 }
                 Err(msg) => println!("{}", msg),
             },
             types::Command::Create2 => {
-                match types::Create2Cell::from_slice(tor_cell.payload) {
+                match types::Create2Cell::from_slice(&tor_cell.payload) {
                     Ok(create2_cell) => {
                         println!("{:?}", create2_cell);
                         // technically we should check create2_cell.h_type here
@@ -180,7 +205,7 @@ impl TorClient {
                     Err(msg) => println!("{}", msg),
                 }
             }
-            types::Command::Created2 => match types::Created2Cell::from_slice(tor_cell.payload) {
+            types::Command::Created2 => match types::Created2Cell::from_slice(&tor_cell.payload) {
                 Ok(created2_cell) => self.do_ntor_handshake(tor_cell.circ_id, &created2_cell),
                 Err(msg) => println!("{}", msg),
             },
@@ -268,7 +293,7 @@ impl TorClient {
     }
 
     fn handle_relay_cell(&self, circ_id: u32, direction: Direction, relay_cell: types::RelayCell) {
-        println!("{}", relay_cell);
+        println!("handle_relay_cell({}, {:?}, {}", circ_id, direction, relay_cell);
     }
 }
 

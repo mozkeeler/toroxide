@@ -29,6 +29,8 @@ use std::ops::Mul;
 use std::{thread, time};
 
 struct TorClient {
+    /// Maybe a TLS connection with a peer.
+    tls_connection: Option<tls::TlsConnection>,
     /// Map of circuit id to NtorContext
     ntor_contexts: HashMap<u32, NtorContext>,
     /// Created NtorContext that we don't know what circuit id it's for yet
@@ -108,21 +110,11 @@ fn main() {
 
     let peer = &dir::get_tor_peers()[0];
     println!("{:?}", peer);
-    let mut connection = tls::TlsConnection::new(&peer);
-    let versions = types::VersionsCell::new(vec![4]);
-    let data = versions.to_bytes();
-    match connection.write(&data) {
-        Ok(len) => println!("sent {}", len),
-        Err(e) => panic!(e),
-    };
-    let peer_versions = types::VersionsCell::read_new(&mut connection).unwrap();
-    let version = versions.negotiate(&peer_versions).unwrap();
     let mut tor_client = TorClient::new();
-    println!("negotiated version {}", version);
-    loop {
-        tor_client.decode_input(Direction::Incoming, &mut connection);
-        thread::sleep(time::Duration::from_millis(1000));
-    }
+    tor_client.connect_to(&peer);
+    tor_client.negotiate_versions();
+    tor_client.read_certs();
+    tor_client.read_auth_challenge();
 }
 
 fn debug_dump_from_stdin() {
@@ -146,9 +138,64 @@ enum Direction {
 impl TorClient {
     fn new() -> TorClient {
         TorClient {
+            tls_connection: None,
             ntor_contexts: HashMap::new(),
             pending_ntor_context: None,
             ntor_keys: HashMap::new(),
+        }
+    }
+
+    fn connect_to(&mut self, peer: &dir::TorPeer) {
+        self.tls_connection = Some(tls::TlsConnection::new(peer));
+    }
+
+    fn negotiate_versions(&mut self) {
+        let versions = types::VersionsCell::new(vec![4]);
+        let data = versions.to_bytes();
+        let mut connection = match self.tls_connection {
+            Some(ref mut connection) => connection,
+            None => panic!("invalid state - call connect_to first"),
+        };
+        match connection.write(&data) {
+            Ok(len) => println!("sent {}", len),
+            Err(e) => panic!(e),
+        };
+        let peer_versions = types::VersionsCell::read_new(&mut connection).unwrap();
+        let version = versions.negotiate(&peer_versions).unwrap();
+        println!("negotiated version {}", version);
+    }
+
+    fn read_certs(&mut self) {
+        let mut connection = match self.tls_connection {
+            Some(ref mut connection) => connection,
+            None => panic!("invalid state - call connect_to first"),
+        };
+        // Also assert versions negotiated?
+        let cell = types::Cell::read_new(&mut connection).unwrap();
+        match cell.command {
+            types::Command::Certs => match types::CertsCell::read_new(&mut &cell.payload[..]) {
+                Ok(certs_cell) => println!("{:?}", certs_cell),
+                Err(msg) => println!("{}", msg),
+            },
+            _ => panic!("Expected CERTS, got {:?}", cell.command),
+        };
+    }
+
+    fn read_auth_challenge(&mut self) {
+        let mut connection = match self.tls_connection {
+            Some(ref mut connection) => connection,
+            None => panic!("invalid state - call connect_to first"),
+        };
+        // Also assert everything beforehand...?
+        let cell = types::Cell::read_new(&mut connection).unwrap();
+        match cell.command {
+            types::Command::AuthChallenge => {
+                match types::AuthChallengeCell::read_new(&mut &cell.payload[..]) {
+                    Ok(auth_challenge_cell) => println!("{:?}", auth_challenge_cell),
+                    Err(msg) => println!("{}", msg),
+                }
+            }
+            _ => panic!("Expected AUTH_CHALLENGE, got {:?}", cell.command),
         }
     }
 
@@ -213,6 +260,12 @@ impl TorClient {
                 Ok(certs_cell) => println!("{:?}", certs_cell),
                 Err(msg) => println!("{}", msg),
             },
+            types::Command::AuthChallenge => {
+                match types::AuthChallengeCell::read_new(&mut &tor_cell.payload[..]) {
+                    Ok(auth_challenge_cell) => println!("{:?}", auth_challenge_cell),
+                    Err(msg) => println!("{}", msg),
+                }
+            }
             _ => {}
         }
     }

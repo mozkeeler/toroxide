@@ -184,6 +184,57 @@ impl CertsCell {
     }
 }
 
+#[derive(Debug)]
+pub enum AuthType {
+    RsaSha256TlsSecret,
+    Ed25519Sha256Rfc5705,
+    Unknown(u16),
+}
+
+impl AuthType {
+    fn from_u16(auth_type: u16) -> AuthType {
+        match auth_type {
+            1 => AuthType::RsaSha256TlsSecret,
+            3 => AuthType::Ed25519Sha256Rfc5705,
+            _ => AuthType::Unknown(auth_type),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AuthChallengeCell {
+    challenge: [u8; 32],
+    methods: Vec<AuthType>,
+}
+
+impl AuthChallengeCell {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<AuthChallengeCell, &'static str> {
+        let mut auth_challenge_cell = AuthChallengeCell {
+            challenge: [0; 32],
+            methods: Vec::new(),
+        };
+        if let Err(_) = reader.read_exact(&mut auth_challenge_cell.challenge) {
+            return Err("failed to read challenge bytes");
+        }
+        let mut two_byte_buf = [0; 2];
+        if let Err(_) = reader.read_exact(&mut two_byte_buf) {
+            return Err("failed to read number of methods");
+        }
+        // There's only two methods possible.
+        if two_byte_buf[0] != 0 || two_byte_buf[1] > 2 || two_byte_buf[1] == 0 {
+            return Err("invalid number of methods");
+        }
+        for _ in 0..two_byte_buf[1] {
+            if let Err(_) = reader.read_exact(&mut two_byte_buf) {
+                return Err("failed to read method");
+            }
+            let method: u16 = ((two_byte_buf[0] as u16) << 8) + two_byte_buf[1] as u16;
+            auth_challenge_cell.methods.push(AuthType::from_u16(method));
+        }
+        Ok(auth_challenge_cell)
+    }
+}
+
 // Useful for reading something of an unknown size from a slice of bytes and then continuing to read
 // the bytes after that something (where it internally knows how large it is).
 pub struct Cursor<'a> {

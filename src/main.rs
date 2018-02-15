@@ -1,8 +1,8 @@
 extern crate base64;
 extern crate constant_time_eq;
 extern crate crypto;
-extern crate curve25519_dalek;
 extern crate curl;
+extern crate curve25519_dalek;
 extern crate getopts;
 extern crate hex;
 extern crate hmac;
@@ -297,7 +297,10 @@ impl TorClient {
     }
 
     fn handle_relay_cell(&self, circ_id: u32, direction: Direction, relay_cell: types::RelayCell) {
-        println!("handle_relay_cell({}, {:?}, {}", circ_id, direction, relay_cell);
+        println!(
+            "handle_relay_cell({}, {:?}, {}",
+            circ_id, direction, relay_cell
+        );
     }
 }
 

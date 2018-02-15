@@ -1,5 +1,5 @@
 use curl::easy::Easy;
-use std::net::{SocketAddr, IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::option;
 use std::io;
@@ -17,10 +17,12 @@ fn do_get(uri: &str) -> String {
     {
         // Ok this is for sure poor API design, though.
         let mut transfer = handle.transfer();
-        transfer.write_function(|new_data| {
-            data.extend_from_slice(new_data);
-            Ok(new_data.len())
-        }).unwrap();
+        transfer
+            .write_function(|new_data| {
+                data.extend_from_slice(new_data);
+                Ok(new_data.len())
+            })
+            .unwrap();
         transfer.perform().unwrap();
     }
     String::from_utf8(data).unwrap()
@@ -54,8 +56,10 @@ impl TorPeer {
     }
 
     fn new(router_line: &str, m_hash_line: &str) -> TorPeer {
-        let keys_uri = format!("http://localhost:7000/tor/micro/d/{}",
-                               m_hash_line.split(" ").nth(1).unwrap());
+        let keys_uri = format!(
+            "http://localhost:7000/tor/micro/d/{}",
+            m_hash_line.split(" ").nth(1).unwrap()
+        );
         let keys_data = do_get(&keys_uri);
         let mut ntor_onion_key: [u8; 32] = [0; 32];
         let mut in_rsa_key = false;
@@ -71,8 +75,9 @@ impl TorPeer {
                 in_rsa_key = true;
             }
             if line.starts_with("ntor-onion-key") {
-                ntor_onion_key = util::slice_to_32_byte_array(
-                    &base64::decode(line.split(" ").nth(1).unwrap()).unwrap());
+                ntor_onion_key = util::slice_to_32_byte_array(&base64::decode(
+                    line.split(" ").nth(1).unwrap(),
+                ).unwrap());
             }
         }
         let router_parts: Vec<&str> = router_line.split(" ").collect();

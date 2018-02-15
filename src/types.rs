@@ -63,9 +63,12 @@ impl Command {
 
     fn is_variable_length(&self) -> bool {
         match *self {
-            Command::VPadding | Command::Certs | Command::AuthChallenge |
-            Command::Authenticate | Command::Authorize => true,
-            _ => false
+            Command::VPadding
+            | Command::Certs
+            | Command::AuthChallenge
+            | Command::Authenticate
+            | Command::Authorize => true,
+            _ => false,
         }
     }
 }

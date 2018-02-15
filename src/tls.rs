@@ -1,5 +1,5 @@
 //use base64;
-use openssl::ssl::{Ssl, SslContext, SslStream, SslMethod, SslVerifyMode};
+use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream, SslVerifyMode};
 use std::net::TcpStream;
 use std::io::{Read, Result, Write};
 
@@ -23,7 +23,6 @@ impl TlsConnection {
             stream: ssl.connect(stream).unwrap(),
         }
     }
-
 }
 
 impl Read for TlsConnection {

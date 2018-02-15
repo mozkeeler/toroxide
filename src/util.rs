@@ -10,4 +10,3 @@ pub fn hexdump(bytes: &[u8]) {
     }
     println!();
 }
-

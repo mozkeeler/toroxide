@@ -3,14 +3,17 @@ extern crate constant_time_eq;
 extern crate crypto;
 extern crate curl;
 extern crate curve25519_dalek;
+extern crate ed25519_dalek;
 extern crate getopts;
 extern crate hex;
 extern crate hmac;
 extern crate openssl;
+extern crate rand;
 extern crate sha2;
 
 mod certs;
 mod dir;
+mod keys;
 mod tls;
 mod types;
 mod util;
@@ -200,6 +203,9 @@ impl TorClient {
             }
             _ => panic!("Expected AUTH_CHALLENGE, got {:?}", cell.command),
         }
+        let rsa_identity_key = keys::RsaKey::new(1024).unwrap();
+        let rsa_identity_cert = rsa_identity_key.generate_self_signed_cert().unwrap();
+        let ed25519_identity_key = keys::Ed25519Key::new();
     }
 
     fn handle_event(&mut self, event: &String) {

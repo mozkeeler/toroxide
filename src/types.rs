@@ -187,17 +187,30 @@ impl CertsCell {
 
     // TODO: other cert types, obv.
     // also should probably return a result if something fails to decode?
-    pub fn decode_certs(&self) -> Vec<certs::Ed25519Cert> {
-        let mut certs: Vec<certs::Ed25519Cert> = Vec::new();
+    pub fn decode_certs(&self) -> Vec<certs::Cert> {
+        let mut certs: Vec<certs::Cert> = Vec::new();
         for cert in &self.certs {
+            // Obviously this should be refactored into certs::read_new...
             match cert.cert_type {
                 CertType::Ed25519SigningKey
                 | CertType::TlsLink
                 | CertType::Ed25519AuthenticateCell => {
                     match certs::Ed25519Cert::read_new(&mut &cert.bytes[..]) {
-                        Ok(cert) => certs.push(cert),
+                        Ok(cert) => certs.push(certs::Cert::Ed25519Cert(cert)),
                         Err(e) => println!("{}", e),
                     };
+                }
+                CertType::Ed25519Identity => {
+                    match certs::Ed25519Identity::read_new(&mut &cert.bytes[..]) {
+                        Ok(cert) => certs.push(certs::Cert::Ed25519Identity(cert)),
+                        Err(e) => println!("{}", e),
+                    }
+                }
+                CertType::LinkKey | CertType::RsaIdentity | CertType::RsaAuthenticateCell => {
+                    match certs::X509Cert::read_new(&mut &cert.bytes[..]) {
+                        Ok(cert) => certs.push(certs::Cert::X509Cert(cert)),
+                        Err(e) => println!("{}", e),
+                    }
                 }
                 _ => {}
             }

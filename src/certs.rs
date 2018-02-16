@@ -1,5 +1,12 @@
-//use openssl::x509::X509;
+use openssl::x509::X509;
 use std::io::Read;
+
+#[derive(Debug)]
+pub enum Cert {
+    Ed25519Cert(Ed25519Cert),
+    Ed25519Identity(Ed25519Identity),
+    X509Cert(X509Cert),
+}
 
 pub type HoursSinceEpoch = u32;
 
@@ -16,7 +23,7 @@ pub struct Ed25519Cert {
 
 impl Ed25519Cert {
     pub fn read_new<R: Read>(reader: &mut R) -> Result<Ed25519Cert, &'static str> {
-        let mut one_byte_buf = [0; 2];
+        let mut one_byte_buf = [0; 1];
         if let Err(_) = reader.read_exact(&mut one_byte_buf) {
             return Err("failed to read certificate version");
         }
@@ -132,7 +139,7 @@ impl Ed25519CertExtension {
             return Err("failed to read extension flags");
         }
         let ext_flags = Ed25519CertExtensionFlags::from_u8(one_byte_buf[0]);
-        let mut ext_data: Vec<u8> = Vec::new();
+        let mut ext_data: Vec<u8> = Vec::with_capacity(length);
         ext_data.resize(length, 0);
         if let Err(_) = reader.read_exact(ext_data.as_mut_slice()) {
             return Err("failed to read extension data");
@@ -175,5 +182,62 @@ impl Ed25519CertExtensionFlags {
             1 => Ed25519CertExtensionFlags::Critical,
             _ => Ed25519CertExtensionFlags::Unknown(ext_flags),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct Ed25519Identity {
+    ed25519_key: [u8; 32],
+    expiration_date: HoursSinceEpoch,
+    signature: Vec<u8>,
+}
+
+impl Ed25519Identity {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<Ed25519Identity, &'static str> {
+        let mut ed25519_key = [0; 32];
+        if let Err(_) = reader.read_exact(&mut ed25519_key) {
+            return Err("failed to read ed25519 key");
+        }
+        let mut four_byte_buf = [0; 4];
+        if let Err(_) = reader.read_exact(&mut four_byte_buf) {
+            return Err("failed to read expiration time");
+        }
+        let expiration_date = ((four_byte_buf[0] as u32) << 24) + ((four_byte_buf[1] as u32) << 16)
+            + ((four_byte_buf[2] as u32) << 16)
+            + (four_byte_buf[3] as u32);
+        let mut one_byte_buf = [0; 1];
+        if let Err(_) = reader.read_exact(&mut one_byte_buf) {
+            return Err("failed to read signature length");
+        }
+        let mut signature: Vec<u8> = Vec::with_capacity(one_byte_buf[0] as usize);
+        signature.resize(one_byte_buf[0] as usize, 0);
+        if let Err(_) = reader.read_exact(signature.as_mut_slice()) {
+            return Err("failed to read signature");
+        }
+        Ok(Ed25519Identity {
+            ed25519_key: ed25519_key,
+            expiration_date: expiration_date,
+            signature: signature,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct X509Cert {
+    der: Vec<u8>,
+}
+
+impl X509Cert {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<X509Cert, &'static str> {
+        let mut x509cert = X509Cert { der: Vec::new() };
+        if let Err(_) = reader.read_to_end(&mut x509cert.der) {
+            return Err("failed to read x509 cert");
+        }
+        // make sure we can decode the certificate (for whatever reason I don't want to keep a
+        // handle on the openssl::x509::X509...)
+        if let Err(_) = X509::from_der(&x509cert.der) {
+            return Err("failed to decode x509 cert");
+        }
+        Ok(x509cert)
     }
 }

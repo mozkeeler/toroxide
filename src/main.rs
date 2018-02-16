@@ -9,10 +9,11 @@ extern crate hmac;
 extern crate openssl;
 extern crate sha2;
 
+mod certs;
+mod dir;
 mod tls;
 mod types;
 mod util;
-mod dir;
 
 use constant_time_eq::constant_time_eq;
 use crypto::{aes, symmetriccipher};
@@ -26,7 +27,6 @@ use std::env;
 use std::io::prelude::*;
 use std::io;
 use std::ops::Mul;
-use std::{thread, time};
 
 struct TorClient {
     /// Maybe a TLS connection with a peer.
@@ -174,7 +174,10 @@ impl TorClient {
         let cell = types::Cell::read_new(&mut connection).unwrap();
         match cell.command {
             types::Command::Certs => match types::CertsCell::read_new(&mut &cell.payload[..]) {
-                Ok(certs_cell) => println!("{:?}", certs_cell),
+                Ok(certs_cell) => {
+                    println!("{:?}", certs_cell);
+                    println!("{:?}", certs_cell.decode_certs());
+                }
                 Err(msg) => println!("{}", msg),
             },
             _ => panic!("Expected CERTS, got {:?}", cell.command),

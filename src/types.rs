@@ -2,6 +2,8 @@ use std::fmt;
 use std::str;
 use std::io::Read;
 
+use certs;
+
 const PAYLOAD_LEN: usize = 509;
 const CELL_LEN: usize = 514; // link protocol v4 is the only one supported at the moment
 
@@ -136,13 +138,13 @@ impl CertType {
 }
 
 #[derive(Debug)]
-pub struct Cert {
+pub struct RawCert {
     cert_type: CertType,
-    cert: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
-impl Cert {
-    pub fn read_new<R: Read>(reader: &mut R) -> Result<Cert, &'static str> {
+impl RawCert {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<RawCert, &'static str> {
         let mut one_byte_buf = [0; 1];
         if let Err(_) = reader.read_exact(&mut one_byte_buf) {
             return Err("failed to read cert type");
@@ -152,12 +154,12 @@ impl Cert {
             return Err("failed to read cert length");
         }
         let length = ((two_byte_buf[0] as usize) << 8) + two_byte_buf[1] as usize;
-        let mut cert = Cert {
+        let mut cert = RawCert {
             cert_type: CertType::from_utf8(one_byte_buf[0]),
-            cert: Vec::with_capacity(length),
+            bytes: Vec::with_capacity(length),
         };
-        cert.cert.resize(length, 0);
-        if let Err(_) = reader.read_exact(cert.cert.as_mut_slice()) {
+        cert.bytes.resize(length, 0);
+        if let Err(_) = reader.read_exact(cert.bytes.as_mut_slice()) {
             return Err("failed to read cert bytes");
         }
         Ok(cert)
@@ -166,7 +168,7 @@ impl Cert {
 
 #[derive(Debug)]
 pub struct CertsCell {
-    certs: Vec<Cert>,
+    certs: Vec<RawCert>,
 }
 
 impl CertsCell {
@@ -175,12 +177,32 @@ impl CertsCell {
         if let Err(_) = reader.read_exact(&mut one_byte_buf) {
             return Err("failed to read number of certs");
         }
-        let mut certs: Vec<Cert> = Vec::with_capacity(one_byte_buf[0] as usize);
+        let mut certs: Vec<RawCert> = Vec::with_capacity(one_byte_buf[0] as usize);
         for _ in 0..one_byte_buf[0] {
-            let cert = Cert::read_new(reader)?;
+            let cert = RawCert::read_new(reader)?;
             certs.push(cert);
         }
         Ok(CertsCell { certs: certs })
+    }
+
+    // TODO: other cert types, obv.
+    // also should probably return a result if something fails to decode?
+    pub fn decode_certs(&self) -> Vec<certs::Ed25519Cert> {
+        let mut certs: Vec<certs::Ed25519Cert> = Vec::new();
+        for cert in &self.certs {
+            match cert.cert_type {
+                CertType::Ed25519SigningKey
+                | CertType::TlsLink
+                | CertType::Ed25519AuthenticateCell => {
+                    match certs::Ed25519Cert::read_new(&mut &cert.bytes[..]) {
+                        Ok(cert) => certs.push(cert),
+                        Err(e) => println!("{}", e),
+                    };
+                }
+                _ => {}
+            }
+        }
+        certs
     }
 }
 

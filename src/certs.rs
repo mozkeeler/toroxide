@@ -73,6 +73,41 @@ impl Ed25519Cert {
             signature: signature,
         })
     }
+
+    pub fn new_unsigned(cert_type: Ed25519CertType, certified_key: [u8; 32]) -> Ed25519Cert {
+        Ed25519Cert {
+            cert_type: cert_type,
+            expiration_date: 0x0100_0000, // TODO
+            certified_key_type: Ed25519CertifiedKeyType::Ed25519Key,
+            certified_key: certified_key,
+            extensions: Vec::new(),
+            signature: Vec::new(),
+        }
+    }
+
+    pub fn get_tbs_bytes(&self) -> Vec<u8> {
+        let mut tbs_bytes: Vec<u8> = Vec::new();
+        tbs_bytes.push(1);
+        tbs_bytes.push(self.cert_type.as_u8());
+        // TODO: ugh
+        tbs_bytes.push((self.expiration_date >> 24) as u8);
+        tbs_bytes.push(((self.expiration_date >> 16) & 0xff) as u8);
+        tbs_bytes.push(((self.expiration_date >> 8) & 0xff) as u8);
+        tbs_bytes.push((self.expiration_date & 0xff) as u8);
+        tbs_bytes.push(self.certified_key_type.as_u8());
+        tbs_bytes.extend(self.certified_key.iter());
+        assert!(self.extensions.len() < 256);
+        tbs_bytes.push(self.extensions.len() as u8);
+        for extension in &self.extensions {
+            tbs_bytes.extend(extension.as_bytes());
+        }
+        tbs_bytes
+    }
+
+    pub fn set_signature(&mut self, signature: [u8; 64]) {
+        self.signature.clear();
+        self.signature.extend(signature.iter());
+    }
 }
 
 #[derive(Debug)]
@@ -83,16 +118,29 @@ pub enum Ed25519CertType {
     TlsLinkCertificate,
     // Ed25519 authentication key signed by Ed25519 signing key
     AuthenticationKey,
+    // I think this is the cross-signed Ed25519 ID key (signed by RSA ID key)
+    IdentityKey,
     Unknown(u8),
 }
 
 impl Ed25519CertType {
     fn from_u8(cert_type: u8) -> Ed25519CertType {
         match cert_type {
-            4 => Ed25519CertType::SigningKey,
-            5 => Ed25519CertType::TlsLinkCertificate,
-            6 => Ed25519CertType::AuthenticationKey,
+            0x04 => Ed25519CertType::SigningKey,
+            0x05 => Ed25519CertType::TlsLinkCertificate,
+            0x06 => Ed25519CertType::AuthenticationKey,
+            0x0A => Ed25519CertType::IdentityKey,
             _ => Ed25519CertType::Unknown(cert_type),
+        }
+    }
+
+    fn as_u8(&self) -> u8 {
+        match self {
+            &Ed25519CertType::SigningKey => 0x04,
+            &Ed25519CertType::TlsLinkCertificate => 0x05,
+            &Ed25519CertType::AuthenticationKey => 0x06,
+            &Ed25519CertType::IdentityKey => 0x0A,
+            &Ed25519CertType::Unknown(val) => val,
         }
     }
 }
@@ -112,6 +160,15 @@ impl Ed25519CertifiedKeyType {
             2 => Ed25519CertifiedKeyType::RsaKeySha256Hash,
             3 => Ed25519CertifiedKeyType::X509CertificateSha256Hash,
             _ => Ed25519CertifiedKeyType::Unknown(key_type),
+        }
+    }
+
+    fn as_u8(&self) -> u8 {
+        match self {
+            &Ed25519CertifiedKeyType::Ed25519Key => 1,
+            &Ed25519CertifiedKeyType::RsaKeySha256Hash => 2,
+            &Ed25519CertifiedKeyType::X509CertificateSha256Hash => 3,
+            &Ed25519CertifiedKeyType::Unknown(val) => val,
         }
     }
 }
@@ -150,6 +207,17 @@ impl Ed25519CertExtension {
             ext_data: ext_data,
         })
     }
+
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut bytes: Vec<u8> = Vec::new();
+        assert!(self.ext_data.len() < 65536);
+        bytes.push((self.ext_data.len() >> 8) as u8);
+        bytes.push((self.ext_data.len() & 0xff) as u8);
+        bytes.push(self.ext_type.as_u8());
+        bytes.push(self.ext_flags.as_u8());
+        bytes.extend(self.ext_data.iter());
+        bytes
+    }
 }
 
 #[derive(Debug)]
@@ -163,6 +231,13 @@ impl Ed25519CertExtensionType {
         match ext_type {
             4 => Ed25519CertExtensionType::SignedWithEd25519Key,
             _ => Ed25519CertExtensionType::Unknown(ext_type),
+        }
+    }
+
+    fn as_u8(&self) -> u8 {
+        match self {
+            &Ed25519CertExtensionType::SignedWithEd25519Key => 4,
+            &Ed25519CertExtensionType::Unknown(val) => val,
         }
     }
 }
@@ -181,6 +256,14 @@ impl Ed25519CertExtensionFlags {
             0 => Ed25519CertExtensionFlags::None,
             1 => Ed25519CertExtensionFlags::Critical,
             _ => Ed25519CertExtensionFlags::Unknown(ext_flags),
+        }
+    }
+
+    fn as_u8(&self) -> u8 {
+        match self {
+            &Ed25519CertExtensionFlags::None => 0,
+            &Ed25519CertExtensionFlags::Critical => 1,
+            &Ed25519CertExtensionFlags::Unknown(val) => val,
         }
     }
 }
@@ -219,6 +302,18 @@ impl Ed25519Identity {
             expiration_date: expiration_date,
             signature: signature,
         })
+    }
+
+    pub fn new(
+        ed25519_key: [u8; 32],
+        expiration_date: HoursSinceEpoch,
+        signature: Vec<u8>,
+    ) -> Ed25519Identity {
+        Ed25519Identity {
+            ed25519_key: ed25519_key,
+            expiration_date: expiration_date,
+            signature: signature,
+        }
     }
 }
 

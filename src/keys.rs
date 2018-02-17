@@ -5,6 +5,7 @@ use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private};
 use openssl::rand::rand_bytes;
 use openssl::rsa::Rsa;
+use openssl::sign::Signer;
 use openssl::x509::{X509Builder, X509NameBuilder};
 use rand::OsRng;
 use sha2::Sha512;
@@ -57,7 +58,7 @@ impl RsaKey {
         let not_after = Asn1Time::days_from_now(1000).unwrap();
         builder.set_not_after(&not_after).unwrap();
         builder.set_pubkey(&self.key).unwrap();
-        builder.sign(&self.key, MessageDigest::sha256());
+        builder.sign(&self.key, MessageDigest::sha256()).unwrap();
         let x509 = builder.build();
         let der = x509.to_der().unwrap();
         certs::X509Cert::read_new(&mut &der[..])
@@ -67,7 +68,21 @@ impl RsaKey {
         &self,
         ed25519key: &Ed25519Key,
     ) -> Result<certs::Ed25519Identity, &'static str> {
-        Err("unimplemented")
+        // The payload to be signed is:
+        // "Tor TLS RSA/Ed25519 cross-certificate" || Ed25519 public key (32 bytes) ||
+        // expiration date (hours since epoch - 4 bytes)
+        let mut signer = Signer::new(MessageDigest::sha256(), &self.key).unwrap();
+        signer
+            .update(b"Tor TLS RSA/Ed25519 cross-certificate")
+            .unwrap();
+        signer.update(ed25519key.key.public.as_bytes()).unwrap();
+        signer.update(&[1, 0, 0, 0]).unwrap(); // This is sometime in the year 3883.
+        let signature = signer.sign_to_vec().unwrap();
+        Ok(certs::Ed25519Identity::new(
+            *ed25519key.key.public.as_bytes(),
+            0x0100_0000,
+            signature,
+        ))
     }
 }
 
@@ -81,5 +96,19 @@ impl Ed25519Key {
         Ed25519Key {
             key: Keypair::generate::<Sha512>(&mut csprng),
         }
+    }
+
+    pub fn sign_ed25519_key(
+        &self,
+        other: &Ed25519Key,
+        cert_type: certs::Ed25519CertType,
+    ) -> certs::Ed25519Cert {
+        let mut to_be_signed: Vec<u8> = Vec::new();
+        to_be_signed.extend(b"Tor node signing key certificate v1".iter().cloned());
+        let mut new_cert = certs::Ed25519Cert::new_unsigned(cert_type, other.key.public.to_bytes());
+        to_be_signed.extend(new_cert.get_tbs_bytes());
+        let signature = self.key.sign::<Sha512>(&to_be_signed).to_bytes();
+        new_cert.set_signature(signature);
+        new_cert
     }
 }

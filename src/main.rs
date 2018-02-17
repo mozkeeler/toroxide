@@ -206,6 +206,13 @@ impl TorClient {
         let rsa_identity_key = keys::RsaKey::new(1024).unwrap();
         let rsa_identity_cert = rsa_identity_key.generate_self_signed_cert().unwrap();
         let ed25519_identity_key = keys::Ed25519Key::new();
+        let ed25519_identity_cert = rsa_identity_key
+            .sign_ed25519_key(&ed25519_identity_key)
+            .unwrap();
+        let ed25519_signing_key = keys::Ed25519Key::new();
+        let ed25519_signing_cert = ed25519_identity_key
+            .sign_ed25519_key(&ed25519_signing_key, certs::Ed25519CertType::SigningKey);
+        println!("{:?}", ed25519_signing_cert);
     }
 
     fn handle_event(&mut self, event: &String) {

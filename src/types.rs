@@ -112,12 +112,12 @@ impl Cell {
 
 #[derive(Debug)]
 pub enum CertType {
-    LinkKey,
+    RsaLink,
     RsaIdentity,
-    RsaAuthenticateCell,
-    Ed25519SigningKey,
-    TlsLink,
-    Ed25519AuthenticateCell,
+    RsaAuthenticate,
+    Ed25519Signing,
+    Ed25519Link,
+    Ed25519Authenticate,
     Ed25519Identity,
     Unknown(u8),
 }
@@ -125,12 +125,12 @@ pub enum CertType {
 impl CertType {
     fn from_utf8(cert_type: u8) -> CertType {
         match cert_type {
-            1 => CertType::LinkKey,
+            1 => CertType::RsaLink,
             2 => CertType::RsaIdentity,
-            3 => CertType::RsaAuthenticateCell,
-            4 => CertType::Ed25519SigningKey,
-            5 => CertType::TlsLink,
-            6 => CertType::Ed25519AuthenticateCell,
+            3 => CertType::RsaAuthenticate,
+            4 => CertType::Ed25519Signing,
+            5 => CertType::Ed25519Link,
+            6 => CertType::Ed25519Authenticate,
             7 => CertType::Ed25519Identity,
             _ => CertType::Unknown(cert_type),
         }
@@ -185,30 +185,47 @@ impl CertsCell {
         Ok(CertsCell { certs: certs })
     }
 
-    // TODO: other cert types, obv.
     // also should probably return a result if something fails to decode?
     pub fn decode_certs(&self) -> Vec<certs::Cert> {
         let mut certs: Vec<certs::Cert> = Vec::new();
         for cert in &self.certs {
             // Obviously this should be refactored into certs::read_new...
             match cert.cert_type {
-                CertType::Ed25519SigningKey
-                | CertType::TlsLink
-                | CertType::Ed25519AuthenticateCell => {
+                CertType::RsaLink => match certs::X509Cert::read_new(&mut &cert.bytes[..]) {
+                    Ok(cert) => certs.push(certs::Cert::RsaLink(cert)),
+                    Err(e) => println!("{}", e),
+                },
+                CertType::RsaIdentity => match certs::X509Cert::read_new(&mut &cert.bytes[..]) {
+                    Ok(cert) => certs.push(certs::Cert::RsaIdentity(cert)),
+                    Err(e) => println!("{}", e),
+                },
+                CertType::RsaAuthenticate => {
+                    match certs::X509Cert::read_new(&mut &cert.bytes[..]) {
+                        Ok(cert) => certs.push(certs::Cert::RsaAuthenticate(cert)),
+                        Err(e) => println!("{}", e),
+                    }
+                }
+                CertType::Ed25519Signing => {
                     match certs::Ed25519Cert::read_new(&mut &cert.bytes[..]) {
-                        Ok(cert) => certs.push(certs::Cert::Ed25519Cert(cert)),
+                        Ok(cert) => certs.push(certs::Cert::Ed25519Signing(cert)),
+                        Err(e) => println!("{}", e),
+                    };
+                }
+                CertType::Ed25519Link => {
+                    match certs::Ed25519Cert::read_new(&mut &cert.bytes[..]) {
+                        Ok(cert) => certs.push(certs::Cert::Ed25519Link(cert)),
+                        Err(e) => println!("{}", e),
+                    };
+                }
+                CertType::Ed25519Authenticate => {
+                    match certs::Ed25519Cert::read_new(&mut &cert.bytes[..]) {
+                        Ok(cert) => certs.push(certs::Cert::Ed25519Authenticate(cert)),
                         Err(e) => println!("{}", e),
                     };
                 }
                 CertType::Ed25519Identity => {
                     match certs::Ed25519Identity::read_new(&mut &cert.bytes[..]) {
                         Ok(cert) => certs.push(certs::Cert::Ed25519Identity(cert)),
-                        Err(e) => println!("{}", e),
-                    }
-                }
-                CertType::LinkKey | CertType::RsaIdentity | CertType::RsaAuthenticateCell => {
-                    match certs::X509Cert::read_new(&mut &cert.bytes[..]) {
-                        Ok(cert) => certs.push(certs::Cert::X509Cert(cert)),
                         Err(e) => println!("{}", e),
                     }
                 }

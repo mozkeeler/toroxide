@@ -1,11 +1,16 @@
 use openssl::x509::X509;
 use std::io::Read;
 
+// errg so having this and types::CertType seems a bit unnecessary?
 #[derive(Debug)]
 pub enum Cert {
-    Ed25519Cert(Ed25519Cert),
+    RsaLink(X509Cert),
+    RsaIdentity(X509Cert),
+    RsaAuthenticate(X509Cert),
+    Ed25519Signing(Ed25519Cert),
+    Ed25519Link(Ed25519Cert),
+    Ed25519Authenticate(Ed25519Cert),
     Ed25519Identity(Ed25519Identity),
-    X509Cert(X509Cert),
 }
 
 pub type HoursSinceEpoch = u32;

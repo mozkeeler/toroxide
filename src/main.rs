@@ -179,7 +179,8 @@ impl TorClient {
             types::Command::Certs => match types::CertsCell::read_new(&mut &cell.payload[..]) {
                 Ok(certs_cell) => {
                     println!("{:?}", certs_cell);
-                    println!("{:?}", certs_cell.decode_certs());
+                    let responder_certs = ResponderCerts::new(certs_cell.decode_certs()).unwrap();
+                    println!("{:?}", responder_certs);
                 }
                 Err(msg) => println!("{}", msg),
             },
@@ -439,4 +440,64 @@ fn compute_ntor_keys(key_seed: &[u8]) -> NtorKeys {
     k.write_all(&k_2).unwrap();
     k.write_all(&k_3).unwrap();
     NtorKeys::new(&k)
+}
+
+/// Represents the certs that are supposed to be present in a responder's CERTS cell.
+/// If any of these are None, the cell is invalid.
+#[derive(Debug)]
+struct ResponderCerts {
+    rsa_identity_cert: Option<certs::X509Cert>,
+    ed25519_signing_cert: Option<certs::Ed25519Cert>,
+    ed25519_link_cert: Option<certs::Ed25519Cert>,
+    ed25519_authenticate_cert: Option<certs::Ed25519Cert>,
+    ed25519_identity_cert: Option<certs::Ed25519Identity>,
+}
+
+impl ResponderCerts {
+    fn new(certs: Vec<certs::Cert>) -> Result<ResponderCerts, &'static str> {
+        let mut responder_certs = ResponderCerts {
+            rsa_identity_cert: None,
+            ed25519_signing_cert: None,
+            ed25519_link_cert: None,
+            ed25519_authenticate_cert: None,
+            ed25519_identity_cert: None,
+        };
+
+        for cert in certs {
+            match cert {
+                certs::Cert::RsaIdentity(cert) => {
+                    if let Some(_) = responder_certs.rsa_identity_cert {
+                        return Err("more than one RSA identity cert -> invalid CERTS cell");
+                    }
+                    responder_certs.rsa_identity_cert = Some(cert);
+                }
+                certs::Cert::Ed25519Signing(cert) => {
+                    if let Some(_) = responder_certs.ed25519_signing_cert {
+                        return Err("more than one RSA identity cert -> invalid CERTS cell");
+                    }
+                    responder_certs.ed25519_signing_cert = Some(cert);
+                }
+                certs::Cert::Ed25519Link(cert) => {
+                    if let Some(_) = responder_certs.ed25519_link_cert {
+                        return Err("more than one RSA identity cert -> invalid CERTS cell");
+                    }
+                    responder_certs.ed25519_link_cert = Some(cert);
+                }
+                certs::Cert::Ed25519Authenticate(cert) => {
+                    if let Some(_) = responder_certs.ed25519_authenticate_cert {
+                        return Err("more than one RSA identity cert -> invalid CERTS cell");
+                    }
+                    responder_certs.ed25519_authenticate_cert = Some(cert);
+                }
+                certs::Cert::Ed25519Identity(cert) => {
+                    if let Some(_) = responder_certs.ed25519_identity_cert {
+                        return Err("more than one RSA identity cert -> invalid CERTS cell");
+                    }
+                    responder_certs.ed25519_identity_cert = Some(cert);
+                }
+                _ => {} // technically we have to validate these too?
+            }
+        }
+        Ok(responder_certs)
+    }
 }

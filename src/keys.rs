@@ -1,25 +1,26 @@
 use ed25519_dalek::Keypair;
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
-use openssl::hash::MessageDigest;
-use openssl::pkey::{PKey, Private};
+use openssl::hash::{Hasher, MessageDigest};
+use openssl::pkey::{PKey, Private, Public};
 use openssl::rand::rand_bytes;
-use openssl::rsa::Rsa;
-use openssl::sign::Signer;
+use openssl::rsa::{Padding, Rsa};
+use openssl::sign::{Signer, Verifier};
 use openssl::x509::{X509Builder, X509NameBuilder};
 use rand::OsRng;
 use sha2::Sha512;
 
 use certs;
+use util;
 
 pub const MAX_RSA_KEY_BITS: usize = 16384;
 
-pub struct RsaKey {
+pub struct RsaPrivateKey {
     key: PKey<Private>,
 }
 
-impl RsaKey {
-    pub fn new(bit_len: usize) -> Result<RsaKey, &'static str> {
+impl RsaPrivateKey {
+    pub fn new(bit_len: usize) -> Result<RsaPrivateKey, &'static str> {
         if bit_len > MAX_RSA_KEY_BITS {
             return Err("specified RSA key size too large");
         }
@@ -27,7 +28,7 @@ impl RsaKey {
             Ok(key) => key,
             Err(_) => return Err("error generating RSA key"),
         };
-        Ok(RsaKey {
+        Ok(RsaPrivateKey {
             key: PKey::from_rsa(key).unwrap(),
         })
     }
@@ -83,6 +84,48 @@ impl RsaKey {
             0x0100_0000,
             signature,
         ))
+    }
+}
+
+pub struct RsaPublicKey {
+    key: PKey<Public>,
+}
+
+impl RsaPublicKey {
+    pub fn from_spki(spki: &[u8]) -> Result<RsaPublicKey, &'static str> {
+        let key = match PKey::public_key_from_der(spki) {
+            Ok(key) => key,
+            Err(_) => return Err("error decoding SPKI"),
+        };
+        Ok(RsaPublicKey { key: key })
+    }
+
+    pub fn check_ed25519_identity_signature(
+        &self,
+        ed25519_identity_cert: &certs::Ed25519Identity,
+    ) -> bool {
+        util::hexdump(&self.key.public_key_to_der().unwrap());
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend(b"Tor TLS RSA/Ed25519 cross-certificate".iter());
+        buf.extend(ed25519_identity_cert.get_key_bytes());
+        let expiration_date = ed25519_identity_cert.get_expiration_date();
+        buf.extend(&[(expiration_date >> 24) as u8]);
+        buf.extend(&[((expiration_date >> 16) as u8) & 0xff]);
+        buf.extend(&[((expiration_date >> 8) as u8) & 0xff]);
+        buf.extend(&[(expiration_date as u8) & 0xff]);
+        util::hexdump(&buf);
+        util::hexdump(ed25519_identity_cert.get_signature());
+        let mut hasher = Hasher::new(MessageDigest::sha256()).unwrap();
+        hasher.update(&buf).unwrap();
+        let hashed = hasher.finish().unwrap();
+        let rsa_key = &self.key.rsa().unwrap();
+        let mut buf: Vec<u8> = Vec::with_capacity(rsa_key.size() as usize);
+        buf.resize(rsa_key.size() as usize, 0);
+        rsa_key
+            .public_decrypt(&hashed, &mut buf, Padding::PKCS1_OAEP)
+            .unwrap();
+        util::hexdump(&buf);
+        false
     }
 }
 

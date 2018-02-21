@@ -181,6 +181,7 @@ impl TorClient {
                     println!("{:?}", certs_cell);
                     let responder_certs = ResponderCerts::new(certs_cell.decode_certs()).unwrap();
                     println!("{:?}", responder_certs);
+                    println!("{:?}", responder_certs.validate());
                 }
                 Err(msg) => println!("{}", msg),
             },
@@ -204,7 +205,7 @@ impl TorClient {
             }
             _ => panic!("Expected AUTH_CHALLENGE, got {:?}", cell.command),
         }
-        let rsa_identity_key = keys::RsaKey::new(1024).unwrap();
+        let rsa_identity_key = keys::RsaPrivateKey::new(1024).unwrap();
         let rsa_identity_cert = rsa_identity_key.generate_self_signed_cert().unwrap();
         let ed25519_identity_key = keys::Ed25519Key::new();
         let ed25519_identity_cert = rsa_identity_key
@@ -443,61 +444,87 @@ fn compute_ntor_keys(key_seed: &[u8]) -> NtorKeys {
 }
 
 /// Represents the certs that are supposed to be present in a responder's CERTS cell.
-/// If any of these are None, the cell is invalid.
+/// If any of these are None, the cell is invalid (see tor-spec.txt section 4.2).
 #[derive(Debug)]
 struct ResponderCerts {
-    rsa_identity_cert: Option<certs::X509Cert>,
-    ed25519_signing_cert: Option<certs::Ed25519Cert>,
-    ed25519_link_cert: Option<certs::Ed25519Cert>,
-    ed25519_authenticate_cert: Option<certs::Ed25519Cert>,
-    ed25519_identity_cert: Option<certs::Ed25519Identity>,
+    rsa_identity_cert: certs::X509Cert,
+    ed25519_signing_cert: certs::Ed25519Cert,
+    ed25519_link_cert: certs::Ed25519Cert,
+    ed25519_identity_cert: certs::Ed25519Identity,
 }
 
 impl ResponderCerts {
     fn new(certs: Vec<certs::Cert>) -> Result<ResponderCerts, &'static str> {
-        let mut responder_certs = ResponderCerts {
-            rsa_identity_cert: None,
-            ed25519_signing_cert: None,
-            ed25519_link_cert: None,
-            ed25519_authenticate_cert: None,
-            ed25519_identity_cert: None,
-        };
+        let mut rsa_identity_cert: Option<certs::X509Cert> = None;
+        let mut ed25519_signing_cert: Option<certs::Ed25519Cert> = None;
+        let mut ed25519_link_cert: Option<certs::Ed25519Cert> = None;
+        let mut ed25519_identity_cert: Option<certs::Ed25519Identity> = None;
 
+        // Technically we're supposed to ensure all X509 certificates have valid dates and that all
+        // certificate are correctly signed, but...
         for cert in certs {
             match cert {
                 certs::Cert::RsaIdentity(cert) => {
-                    if let Some(_) = responder_certs.rsa_identity_cert {
+                    if let Some(_) = rsa_identity_cert {
                         return Err("more than one RSA identity cert -> invalid CERTS cell");
                     }
-                    responder_certs.rsa_identity_cert = Some(cert);
+                    rsa_identity_cert = Some(cert);
                 }
                 certs::Cert::Ed25519Signing(cert) => {
-                    if let Some(_) = responder_certs.ed25519_signing_cert {
+                    if let Some(_) = ed25519_signing_cert {
                         return Err("more than one RSA identity cert -> invalid CERTS cell");
                     }
-                    responder_certs.ed25519_signing_cert = Some(cert);
+                    ed25519_signing_cert = Some(cert);
                 }
                 certs::Cert::Ed25519Link(cert) => {
-                    if let Some(_) = responder_certs.ed25519_link_cert {
+                    if let Some(_) = ed25519_link_cert {
                         return Err("more than one RSA identity cert -> invalid CERTS cell");
                     }
-                    responder_certs.ed25519_link_cert = Some(cert);
-                }
-                certs::Cert::Ed25519Authenticate(cert) => {
-                    if let Some(_) = responder_certs.ed25519_authenticate_cert {
-                        return Err("more than one RSA identity cert -> invalid CERTS cell");
-                    }
-                    responder_certs.ed25519_authenticate_cert = Some(cert);
+                    ed25519_link_cert = Some(cert);
                 }
                 certs::Cert::Ed25519Identity(cert) => {
-                    if let Some(_) = responder_certs.ed25519_identity_cert {
+                    if let Some(_) = ed25519_identity_cert {
                         return Err("more than one RSA identity cert -> invalid CERTS cell");
                     }
-                    responder_certs.ed25519_identity_cert = Some(cert);
+                    ed25519_identity_cert = Some(cert);
                 }
-                _ => {} // technically we have to validate these too?
+                _ => {}
             }
         }
-        Ok(responder_certs)
+        if rsa_identity_cert.is_none() {
+            return Err("no RSA identity cert");
+        }
+        if ed25519_signing_cert.is_none() {
+            return Err("no ed25519 signing cert");
+        }
+        if ed25519_link_cert.is_none() {
+            return Err("no ed25519 link cert");
+        }
+        if ed25519_identity_cert.is_none() {
+            return Err("no ed25519 identity cert");
+        }
+        Ok(ResponderCerts {
+            rsa_identity_cert: rsa_identity_cert.take().unwrap(),
+            ed25519_signing_cert: ed25519_signing_cert.take().unwrap(),
+            ed25519_link_cert: ed25519_link_cert.take().unwrap(),
+            ed25519_identity_cert: ed25519_identity_cert.take().unwrap(),
+        })
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        // Need to check:
+        // rsa_identity_cert is self-signed
+        // rsa identity key (in rsa_identity_cert) signed ed25519_identity_cert, is 1024 bits
+        // ed25519 identity key (in ed25519_identity_cert) signed ed25519_signing_cert
+        // ed25519 signing key (in ed25519_signing_cert) signed ed25519_link_cert
+        // certified "key" in ed25519_link_cert matches sha-256 hash of TLS peer certificate
+        if !self.rsa_identity_cert.is_self_signed() {
+            return Err("RSA identity cert is not self-signed");
+        }
+        let identity_key = self.rsa_identity_cert.get_key();
+        if !identity_key.check_ed25519_identity_signature(&self.ed25519_identity_cert) {
+            return Err("RSA identity cert did not sign Ed25519 identity cert");
+        }
+        Err("not implemented")
     }
 }

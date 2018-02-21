@@ -1,3 +1,4 @@
+use byteorder::{ByteOrder, NetworkEndian, WriteBytesExt};
 use openssl::x509::X509;
 use openssl::sign::Verifier;
 use openssl::hash::MessageDigest;
@@ -47,9 +48,7 @@ impl Ed25519Cert {
         if let Err(_) = reader.read_exact(&mut four_byte_buf) {
             return Err("failed to read expiration time");
         }
-        let expiration_date = ((four_byte_buf[0] as u32) << 24) + ((four_byte_buf[1] as u32) << 16)
-            + ((four_byte_buf[2] as u32) << 16)
-            + (four_byte_buf[3] as u32);
+        let expiration_date = NetworkEndian::read_u32(&four_byte_buf);
         if let Err(_) = reader.read_exact(&mut one_byte_buf) {
             return Err("failed to read certified key type");
         }
@@ -86,7 +85,8 @@ impl Ed25519Cert {
     pub fn new_unsigned(cert_type: Ed25519CertType, certified_key: [u8; 32]) -> Ed25519Cert {
         Ed25519Cert {
             cert_type: cert_type,
-            expiration_date: 0x0100_0000, // TODO
+            // I think this is 2050-01-01, but maybe this should be dynamic
+            expiration_date: 701288,
             certified_key_type: Ed25519CertifiedKeyType::Ed25519Key,
             certified_key: certified_key,
             extensions: Vec::new(),
@@ -98,11 +98,9 @@ impl Ed25519Cert {
         let mut tbs_bytes: Vec<u8> = Vec::new();
         tbs_bytes.push(1);
         tbs_bytes.push(self.cert_type.as_u8());
-        // TODO: ugh
-        tbs_bytes.push((self.expiration_date >> 24) as u8);
-        tbs_bytes.push(((self.expiration_date >> 16) & 0xff) as u8);
-        tbs_bytes.push(((self.expiration_date >> 8) & 0xff) as u8);
-        tbs_bytes.push((self.expiration_date & 0xff) as u8);
+        tbs_bytes
+            .write_u32::<NetworkEndian>(self.expiration_date)
+            .unwrap();
         tbs_bytes.push(self.certified_key_type.as_u8());
         tbs_bytes.extend(self.certified_key.iter());
         assert!(self.extensions.len() < 256);
@@ -195,7 +193,7 @@ impl Ed25519CertExtension {
         if let Err(_) = reader.read_exact(&mut two_byte_buf) {
             return Err("failed to read extension length");
         }
-        let length: usize = ((two_byte_buf[0] as usize) << 8) + (two_byte_buf[1] as usize);
+        let length: usize = NetworkEndian::read_u16(&two_byte_buf) as usize;
         let mut one_byte_buf = [0; 1];
         if let Err(_) = reader.read_exact(&mut one_byte_buf) {
             return Err("failed to read extension type");
@@ -220,8 +218,7 @@ impl Ed25519CertExtension {
     pub fn as_bytes(&self) -> Vec<u8> {
         let mut bytes: Vec<u8> = Vec::new();
         assert!(self.ext_data.len() < 65536);
-        bytes.push((self.ext_data.len() >> 8) as u8);
-        bytes.push((self.ext_data.len() & 0xff) as u8);
+        bytes.write_u16::<NetworkEndian>(self.ext_data.len() as u16);
         bytes.push(self.ext_type.as_u8());
         bytes.push(self.ext_flags.as_u8());
         bytes.extend(self.ext_data.iter());
@@ -294,9 +291,7 @@ impl Ed25519Identity {
         if let Err(_) = reader.read_exact(&mut four_byte_buf) {
             return Err("failed to read expiration time");
         }
-        let expiration_date = ((four_byte_buf[0] as u32) << 24) + ((four_byte_buf[1] as u32) << 16)
-            + ((four_byte_buf[2] as u32) << 16)
-            + (four_byte_buf[3] as u32);
+        let expiration_date = NetworkEndian::read_u32(&four_byte_buf);
         let mut one_byte_buf = [0; 1];
         if let Err(_) = reader.read_exact(&mut one_byte_buf) {
             return Err("failed to read signature length");

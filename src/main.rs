@@ -1,4 +1,5 @@
 extern crate base64;
+extern crate byteorder;
 extern crate constant_time_eq;
 extern crate crypto;
 extern crate curl;

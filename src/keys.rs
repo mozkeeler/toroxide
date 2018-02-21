@@ -1,3 +1,5 @@
+use byteorder::{NetworkEndian, WriteBytesExt};
+use constant_time_eq::constant_time_eq;
 use ed25519_dalek::Keypair;
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
@@ -14,6 +16,8 @@ use certs;
 use util;
 
 pub const MAX_RSA_KEY_BITS: usize = 16384;
+
+const CROSS_SIGN_PREFIX: &'static [u8; 37] = b"Tor TLS RSA/Ed25519 cross-certificate";
 
 pub struct RsaPrivateKey {
     key: PKey<Private>,
@@ -71,17 +75,25 @@ impl RsaPrivateKey {
     ) -> Result<certs::Ed25519Identity, &'static str> {
         // The payload to be signed is:
         // "Tor TLS RSA/Ed25519 cross-certificate" || Ed25519 public key (32 bytes) ||
-        // expiration date (hours since epoch - 4 bytes)
-        let mut signer = Signer::new(MessageDigest::sha256(), &self.key).unwrap();
-        signer
-            .update(b"Tor TLS RSA/Ed25519 cross-certificate")
+        // expiration date (hours since epoch, 4 bytes)
+        let mut buf: Vec<u8> = Vec::new();
+        // I think this represents 2050-01-01
+        let expiration_date = 701288;
+        buf.extend(CROSS_SIGN_PREFIX.iter());
+        buf.extend(ed25519key.key.public.as_bytes());
+        buf.write_u32::<NetworkEndian>(expiration_date).unwrap();
+        let mut hasher = Hasher::new(MessageDigest::sha256()).unwrap();
+        hasher.update(&buf).unwrap();
+        let hashed = hasher.finish().unwrap();
+        let rsa_key = &self.key.rsa().unwrap();
+        let mut signature: Vec<u8> = Vec::with_capacity(rsa_key.size() as usize);
+        signature.resize(rsa_key.size() as usize, 0);
+        rsa_key
+            .private_encrypt(&hashed, &mut signature, Padding::PKCS1)
             .unwrap();
-        signer.update(ed25519key.key.public.as_bytes()).unwrap();
-        signer.update(&[1, 0, 0, 0]).unwrap(); // This is sometime in the year 3883.
-        let signature = signer.sign_to_vec().unwrap();
         Ok(certs::Ed25519Identity::new(
             *ed25519key.key.public.as_bytes(),
-            0x0100_0000,
+            expiration_date,
             signature,
         ))
     }
@@ -104,28 +116,36 @@ impl RsaPublicKey {
         &self,
         ed25519_identity_cert: &certs::Ed25519Identity,
     ) -> bool {
-        util::hexdump(&self.key.public_key_to_der().unwrap());
         let mut buf: Vec<u8> = Vec::new();
-        buf.extend(b"Tor TLS RSA/Ed25519 cross-certificate".iter());
+        buf.extend(CROSS_SIGN_PREFIX.iter());
         buf.extend(ed25519_identity_cert.get_key_bytes());
         let expiration_date = ed25519_identity_cert.get_expiration_date();
-        buf.extend(&[(expiration_date >> 24) as u8]);
-        buf.extend(&[((expiration_date >> 16) as u8) & 0xff]);
-        buf.extend(&[((expiration_date >> 8) as u8) & 0xff]);
-        buf.extend(&[(expiration_date as u8) & 0xff]);
-        util::hexdump(&buf);
-        util::hexdump(ed25519_identity_cert.get_signature());
+        buf.write_u32::<NetworkEndian>(expiration_date);
         let mut hasher = Hasher::new(MessageDigest::sha256()).unwrap();
         hasher.update(&buf).unwrap();
-        let hashed = hasher.finish().unwrap();
+        let mut hashed = hasher.finish().unwrap();
         let rsa_key = &self.key.rsa().unwrap();
         let mut buf: Vec<u8> = Vec::with_capacity(rsa_key.size() as usize);
         buf.resize(rsa_key.size() as usize, 0);
-        rsa_key
-            .public_decrypt(&hashed, &mut buf, Padding::PKCS1_OAEP)
-            .unwrap();
-        util::hexdump(&buf);
-        false
+        let len_decrypted_bytes = match rsa_key.public_decrypt(
+            ed25519_identity_cert.get_signature(),
+            &mut buf,
+            Padding::PKCS1,
+        ) {
+            Err(_) => return false,
+            Ok(len) => len,
+        };
+        // So since this is public data, we don't have to be concerned about
+        // constant-time-comparison, right?
+        if len_decrypted_bytes < hashed.len() {
+            return false;
+        }
+        for i in 0..len_decrypted_bytes {
+            if hashed[i] != buf[i] {
+                return false;
+            }
+        }
+        true
     }
 }
 

@@ -1,19 +1,16 @@
 use byteorder::{NetworkEndian, WriteBytesExt};
-use constant_time_eq::constant_time_eq;
-use ed25519_dalek::Keypair;
+use ed25519_dalek::{Keypair, PublicKey, Signature};
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
 use openssl::hash::{Hasher, MessageDigest};
 use openssl::pkey::{PKey, Private, Public};
 use openssl::rand::rand_bytes;
 use openssl::rsa::{Padding, Rsa};
-use openssl::sign::{Signer, Verifier};
 use openssl::x509::{X509Builder, X509NameBuilder};
 use rand::OsRng;
 use sha2::Sha512;
 
 use certs;
-use util;
 
 pub const MAX_RSA_KEY_BITS: usize = 16384;
 
@@ -120,10 +117,10 @@ impl RsaPublicKey {
         buf.extend(CROSS_SIGN_PREFIX.iter());
         buf.extend(ed25519_identity_cert.get_key_bytes());
         let expiration_date = ed25519_identity_cert.get_expiration_date();
-        buf.write_u32::<NetworkEndian>(expiration_date);
+        buf.write_u32::<NetworkEndian>(expiration_date).unwrap();
         let mut hasher = Hasher::new(MessageDigest::sha256()).unwrap();
         hasher.update(&buf).unwrap();
-        let mut hashed = hasher.finish().unwrap();
+        let hashed = hasher.finish().unwrap();
         let rsa_key = &self.key.rsa().unwrap();
         let mut buf: Vec<u8> = Vec::with_capacity(rsa_key.size() as usize);
         buf.resize(rsa_key.size() as usize, 0);
@@ -147,6 +144,10 @@ impl RsaPublicKey {
         }
         true
     }
+
+    pub fn get_size_in_bits(&self) -> usize {
+        self.key.rsa().unwrap().size() as usize * 8
+    }
 }
 
 pub struct Ed25519Key {
@@ -167,11 +168,37 @@ impl Ed25519Key {
         cert_type: certs::Ed25519CertType,
     ) -> certs::Ed25519Cert {
         let mut to_be_signed: Vec<u8> = Vec::new();
-        to_be_signed.extend(b"Tor node signing key certificate v1".iter().cloned());
+        // Yeah so cert-spec.txt section 2.1 is just flat out wrong - there is no prefix and the
+        // string "Tor node signing key certificate v1" appears nowhere in the tor codebase.
+        //to_be_signed.extend(b"Tor node signing key certificate v1".iter().cloned());
         let mut new_cert = certs::Ed25519Cert::new_unsigned(cert_type, other.key.public.to_bytes());
         to_be_signed.extend(new_cert.get_tbs_bytes());
         let signature = self.key.sign::<Sha512>(&to_be_signed).to_bytes();
         new_cert.set_signature(signature);
         new_cert
+    }
+}
+
+pub struct Ed25519PublicKey {
+    key: PublicKey,
+}
+
+impl Ed25519PublicKey {
+    pub fn new_from_bytes(key_bytes: [u8; 32]) -> Ed25519PublicKey {
+        Ed25519PublicKey {
+            key: PublicKey::from_bytes(&key_bytes).unwrap(),
+        }
+    }
+
+    pub fn check_ed25519_signature(&self, ed25519_cert: &certs::Ed25519Cert) -> bool {
+        // TODO: check that self.key is what's in ed25519_cert's key-identifying-extension, if
+        // present
+        let mut to_verify: Vec<u8> = Vec::new();
+        // Yeah so cert-spec.txt section 2.1 is just flat out wrong - there is no prefix and the
+        // string "Tor node signing key certificate v1" appears nowhere in the tor codebase.
+        //to_verify.extend(b"Tor node signing key certificate v1".iter().cloned());
+        to_verify.extend(ed25519_cert.get_tbs_bytes());
+        let signature = Signature::from_bytes(ed25519_cert.get_signature()).unwrap();
+        self.key.verify::<Sha512>(&to_verify, &signature)
     }
 }

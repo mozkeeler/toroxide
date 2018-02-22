@@ -115,6 +115,40 @@ impl Ed25519Cert {
         self.signature.clear();
         self.signature.extend(signature.iter());
     }
+
+    pub fn get_signature(&self) -> &[u8] {
+        &self.signature
+    }
+
+    // TODO: this doesn't make sense for non-Ed25519 keys (which brings up the question of why this
+    // is called an Ed25519 Certificate, but ok), so maybe return a Result or something?
+    // (Although see below - apparently we can't be sure that something marked as an Ed25519 key
+    // actually is an Ed25519 key anyway.)
+    pub fn get_key(&self) -> keys::Ed25519PublicKey {
+        keys::Ed25519PublicKey::new_from_bytes(self.certified_key)
+    }
+
+    /// Check that the certified key is an X509 certificate hash and that the given hash matches.
+    pub fn check_x509_certificate_hash(&self, hash: &[u8]) -> bool {
+        // It would make sense to do something like this, but the official implementation is giving
+        // us a Ed25519 link certificate where the certified key type is not marked as the hash of
+        // an x509 certificate, so I guess we just can't check this?
+        /*
+        if self.certified_key_type != Ed25519CertifiedKeyType::X509CertificateSha256Hash {
+            return false;
+        }
+        */
+        // Hmmm these as hard-coded lengths are sort-of a bummer. Maybe use an iterator?
+        if hash.len() != 32 {
+            return false;
+        }
+        for i in 0..32 {
+            if hash[i] != self.certified_key[i] {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -152,7 +186,7 @@ impl Ed25519CertType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Ed25519CertifiedKeyType {
     Ed25519Key,
     RsaKeySha256Hash,
@@ -218,7 +252,9 @@ impl Ed25519CertExtension {
     pub fn as_bytes(&self) -> Vec<u8> {
         let mut bytes: Vec<u8> = Vec::new();
         assert!(self.ext_data.len() < 65536);
-        bytes.write_u16::<NetworkEndian>(self.ext_data.len() as u16);
+        bytes
+            .write_u16::<NetworkEndian>(self.ext_data.len() as u16)
+            .unwrap();
         bytes.push(self.ext_type.as_u8());
         bytes.push(self.ext_flags.as_u8());
         bytes.extend(self.ext_data.iter());
@@ -330,6 +366,10 @@ impl Ed25519Identity {
 
     pub fn get_signature(&self) -> &[u8] {
         &self.signature
+    }
+
+    pub fn get_key(&self) -> keys::Ed25519PublicKey {
+        keys::Ed25519PublicKey::new_from_bytes(self.ed25519_key)
     }
 }
 

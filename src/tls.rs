@@ -1,3 +1,4 @@
+use openssl::hash::MessageDigest;
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream, SslVerifyMode};
 use sha2::{Digest, Sha256};
 use std::net::TcpStream;
@@ -46,6 +47,12 @@ impl TlsConnection {
         let mut bytes: Vec<u8> = Vec::new();
         bytes.extend(writelog.result().into_iter());
         bytes
+    }
+
+    /// Get the sha-256 hash of the peer's certificate.
+    pub fn get_peer_cert_hash(&self) -> Vec<u8> {
+        let peer_cert = self.stream.ssl().peer_certificate().unwrap();
+        peer_cert.fingerprint(MessageDigest::sha256()).unwrap()
     }
 }
 

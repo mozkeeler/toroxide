@@ -182,7 +182,10 @@ impl TorClient {
                     println!("{:?}", certs_cell);
                     let responder_certs = ResponderCerts::new(certs_cell.decode_certs()).unwrap();
                     println!("{:?}", responder_certs);
-                    println!("{:?}", responder_certs.validate());
+                    println!(
+                        "{:?}",
+                        responder_certs.validate(connection.get_peer_cert_hash())
+                    );
                 }
                 Err(msg) => println!("{}", msg),
             },
@@ -215,7 +218,7 @@ impl TorClient {
         let ed25519_signing_key = keys::Ed25519Key::new();
         let ed25519_signing_cert = ed25519_identity_key
             .sign_ed25519_key(&ed25519_signing_key, certs::Ed25519CertType::SigningKey);
-        println!("{:?}", ed25519_signing_cert);
+        let ed25519_identity_public_key = ed25519_identity_cert.get_key();
     }
 
     fn handle_event(&mut self, event: &String) {
@@ -512,20 +515,36 @@ impl ResponderCerts {
         })
     }
 
-    fn validate(&self) -> Result<(), &'static str> {
+    fn validate(&self, peer_cert_hash: Vec<u8>) -> Result<(), &'static str> {
         // Need to check:
         // rsa_identity_cert is self-signed
-        // rsa identity key (in rsa_identity_cert) signed ed25519_identity_cert, is 1024 bits
-        // ed25519 identity key (in ed25519_identity_cert) signed ed25519_signing_cert
-        // ed25519 signing key (in ed25519_signing_cert) signed ed25519_link_cert
-        // certified "key" in ed25519_link_cert matches sha-256 hash of TLS peer certificate
         if !self.rsa_identity_cert.is_self_signed() {
             return Err("RSA identity cert is not self-signed");
         }
+        // rsa identity key (in rsa_identity_cert) signed ed25519_identity_cert, is 1024 bits
         let identity_key = self.rsa_identity_cert.get_key();
         if !identity_key.check_ed25519_identity_signature(&self.ed25519_identity_cert) {
             return Err("RSA identity cert did not sign Ed25519 identity cert");
         }
-        Err("not implemented")
+        if identity_key.get_size_in_bits() != 1024 {
+            return Err("RSA identity key wrong size");
+        }
+        // ed25519 identity key (in ed25519_identity_cert) signed ed25519_signing_cert
+        let ed25519_identity_key = self.ed25519_identity_cert.get_key();
+        if !ed25519_identity_key.check_ed25519_signature(&self.ed25519_signing_cert) {
+            return Err("Ed25519 identity key did not sign Ed25519 signing cert");
+        }
+        // ed25519 signing key (in ed25519_signing_cert) signed ed25519_link_cert
+        let ed25519_signing_key = self.ed25519_signing_cert.get_key();
+        if !ed25519_signing_key.check_ed25519_signature(&self.ed25519_link_cert) {
+            return Err("Ed25519 signing key did not sign Ed25519 link cert");
+        }
+        // certified "key" in ed25519_link_cert matches sha-256 hash of TLS peer certificate
+        if !self.ed25519_link_cert
+            .check_x509_certificate_hash(&peer_cert_hash)
+        {
+            return Err("Ed25519 link key does not match peer certificate");
+        }
+        Ok(())
     }
 }

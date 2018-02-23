@@ -14,7 +14,11 @@ ed25519-dalek = "^0.6"
 getopts = "0.2"
 hex = "0.3.1"
 hmac = "0.5.0"
-openssl = "0.10.3"
+openssl = { path = "../rust-openssl/openssl" }
 rand = "0.4.2"
 rust-crypto = "^0.2"
 sha2 = "0.7.0"
+
+[patch.crates-io]
+openssl = { path = "../rust-openssl/openssl" }
+openssl-sys = { path = "../rust-openssl/openssl-sys" }

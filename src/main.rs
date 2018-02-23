@@ -41,6 +41,8 @@ struct TorClient {
     pending_ntor_context: Option<NtorContext>,
     /// Map of circuit id to NtorKeys
     ntor_keys: HashMap<u32, NtorKeys>,
+    /// Maybe the certs parsed and validated from a peer's CERTS cell
+    responder_certs: Option<ResponderCerts>,
 }
 
 #[allow(non_snake_case)]
@@ -119,6 +121,7 @@ fn main() {
     tor_client.negotiate_versions();
     tor_client.read_certs();
     tor_client.read_auth_challenge();
+    tor_client.send_certs_and_authenticate_cells();
 }
 
 fn debug_dump_from_stdin() {
@@ -146,6 +149,7 @@ impl TorClient {
             ntor_contexts: HashMap::new(),
             pending_ntor_context: None,
             ntor_keys: HashMap::new(),
+            responder_certs: None,
         }
     }
 
@@ -179,13 +183,13 @@ impl TorClient {
         match cell.command {
             types::Command::Certs => match types::CertsCell::read_new(&mut &cell.payload[..]) {
                 Ok(certs_cell) => {
-                    println!("{:?}", certs_cell);
                     let responder_certs = ResponderCerts::new(certs_cell.decode_certs()).unwrap();
-                    println!("{:?}", responder_certs);
-                    println!(
-                        "{:?}",
-                        responder_certs.validate(connection.get_peer_cert_hash())
-                    );
+                    if responder_certs
+                        .validate(connection.get_peer_cert_hash())
+                        .is_ok()
+                    {
+                        self.responder_certs = Some(responder_certs);
+                    } // TODO: else indicate that we need to close the connection?
                 }
                 Err(msg) => println!("{}", msg),
             },
@@ -200,25 +204,39 @@ impl TorClient {
         };
         // Also assert everything beforehand...?
         let cell = types::Cell::read_new(&mut connection).unwrap();
-        match cell.command {
+        let auth_challenge = match cell.command {
             types::Command::AuthChallenge => {
                 match types::AuthChallengeCell::read_new(&mut &cell.payload[..]) {
-                    Ok(auth_challenge_cell) => println!("{:?}", auth_challenge_cell),
-                    Err(msg) => println!("{}", msg),
+                    Ok(auth_challenge_cell) => auth_challenge_cell,
+                    Err(msg) => panic!("error decoding AUTH_CHALLENGE cell: {}", msg),
                 }
             }
             _ => panic!("Expected AUTH_CHALLENGE, got {:?}", cell.command),
+        };
+        println!("{:?}", auth_challenge);
+        if !auth_challenge.has_auth_type(types::AuthType::Ed25519Sha256Rfc5705) {
+            println!("peer doesn't support the auth type we require");
+            // TODO: error out here somehow
         }
-        let rsa_identity_key = keys::RsaPrivateKey::new(1024).unwrap();
-        let rsa_identity_cert = rsa_identity_key.generate_self_signed_cert().unwrap();
-        let ed25519_identity_key = keys::Ed25519Key::new();
-        let ed25519_identity_cert = rsa_identity_key
-            .sign_ed25519_key(&ed25519_identity_key)
-            .unwrap();
-        let ed25519_signing_key = keys::Ed25519Key::new();
-        let ed25519_signing_cert = ed25519_identity_key
-            .sign_ed25519_key(&ed25519_signing_key, certs::Ed25519CertType::SigningKey);
-        let ed25519_identity_public_key = ed25519_identity_cert.get_key();
+        // It seems we don't actually have to do anything else here, since the only thing we would
+        // need is actually in our connection's read digest.
+    }
+
+    fn send_certs_and_authenticate_cells(&mut self) {
+        let mut connection = match self.tls_connection {
+            Some(ref mut connection) => connection,
+            None => panic!("invalid state - call connect_to first"),
+        };
+        let initiator_certs = InitiatorCerts::new();
+        let certs_cell = initiator_certs.to_certs_cell();
+        let mut buf: Vec<u8> = Vec::new();
+        certs_cell.write_to(&mut buf);
+        let cell = types::Cell::new(0, types::Command::Certs, buf);
+        let mut buf: Vec<u8> = Vec::new();
+        cell.write_to(&mut buf);
+        util::hexdump(&buf);
+        let ed25519_identity_key = initiator_certs.get_ed25519_identity_key();
+        let tls_secrets = connection.get_tls_secrets(&ed25519_identity_key.get_public_key_bytes());
     }
 
     fn handle_event(&mut self, event: &String) {
@@ -546,5 +564,75 @@ impl ResponderCerts {
             return Err("Ed25519 link key does not match peer certificate");
         }
         Ok(())
+    }
+}
+
+/// The certificates and keys needed by an initiator (`TorClient`) to perform a link authentication
+/// with a responder.
+struct InitiatorCerts {
+    rsa_identity_key: keys::RsaPrivateKey,
+    rsa_identity_cert: certs::X509Cert,
+    ed25519_identity_key: keys::Ed25519Key,
+    ed25519_identity_cert: certs::Ed25519Identity,
+    ed25519_signing_key: keys::Ed25519Key,
+    ed25519_signing_cert: certs::Ed25519Cert,
+    ed25519_authenticate_key: keys::Ed25519Key,
+    ed25519_authenticate_cert: certs::Ed25519Cert,
+}
+
+impl InitiatorCerts {
+    fn new() -> InitiatorCerts {
+        let rsa_identity_key = keys::RsaPrivateKey::new(1024).unwrap();
+        let rsa_identity_cert = rsa_identity_key.generate_self_signed_cert().unwrap();
+        let ed25519_identity_key = keys::Ed25519Key::new();
+        let ed25519_identity_cert = rsa_identity_key
+            .sign_ed25519_key(&ed25519_identity_key)
+            .unwrap();
+        let ed25519_signing_key = keys::Ed25519Key::new();
+        let ed25519_signing_cert = ed25519_identity_key
+            .sign_ed25519_key(&ed25519_signing_key, certs::Ed25519CertType::SigningKey);
+        let ed25519_authenticate_key = keys::Ed25519Key::new();
+        let ed25519_authenticate_cert = ed25519_identity_key.sign_ed25519_key(
+            &ed25519_authenticate_key,
+            certs::Ed25519CertType::SigningKey,
+        );
+        InitiatorCerts {
+            rsa_identity_key: rsa_identity_key,
+            rsa_identity_cert: rsa_identity_cert,
+            ed25519_identity_key: ed25519_identity_key,
+            ed25519_identity_cert: ed25519_identity_cert,
+            ed25519_signing_key: ed25519_signing_key,
+            ed25519_signing_cert: ed25519_signing_cert,
+            ed25519_authenticate_key: ed25519_authenticate_key,
+            ed25519_authenticate_cert: ed25519_authenticate_cert,
+        }
+    }
+
+    fn to_certs_cell(&self) -> types::CertsCell {
+        let mut certs: Vec<types::RawCert> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        self.rsa_identity_cert.write_to(&mut bytes);
+        certs.push(types::RawCert::new(types::CertType::RsaIdentity, bytes));
+
+        let mut bytes: Vec<u8> = Vec::new();
+        self.ed25519_identity_cert.write_to(&mut bytes);
+        certs.push(types::RawCert::new(types::CertType::Ed25519Identity, bytes));
+
+        let mut bytes: Vec<u8> = Vec::new();
+        self.ed25519_signing_cert.write_to(&mut bytes);
+        certs.push(types::RawCert::new(types::CertType::Ed25519Signing, bytes));
+
+        let mut bytes: Vec<u8> = Vec::new();
+        self.ed25519_authenticate_cert.write_to(&mut bytes);
+        certs.push(types::RawCert::new(
+            types::CertType::Ed25519Authenticate,
+            bytes,
+        ));
+
+        types::CertsCell::new_from_raw_certs(certs)
+    }
+
+    fn get_ed25519_identity_key(&self) -> &keys::Ed25519Key {
+        &self.ed25519_identity_key
     }
 }

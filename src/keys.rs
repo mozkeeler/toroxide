@@ -177,6 +177,10 @@ impl Ed25519Key {
         new_cert.set_signature(signature);
         new_cert
     }
+
+    pub fn get_public_key_bytes(&self) -> [u8; 32] {
+        self.key.public.to_bytes()
+    }
 }
 
 pub struct Ed25519PublicKey {

@@ -54,6 +54,23 @@ impl TlsConnection {
         let peer_cert = self.stream.ssl().peer_certificate().unwrap();
         peer_cert.fingerprint(MessageDigest::sha256()).unwrap()
     }
+
+    /// Get the TLSSECRETS bytes ala tor-spec.txt, section 4.4.2.
+    /// (RFC5705 exporter using the label "EXPORTER FOR TOR TLS CLIENT BINDING AUTH0003", and the
+    /// given context (specified to be the bytes of the client's Ed25519 identity public key).
+    pub fn get_tls_secrets(&mut self, context_key: &[u8; 32]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::with_capacity(32);
+        buf.resize(32, 0);
+        self.stream
+            .ssl()
+            .export_keying_material(
+                &mut buf,
+                "EXPORTER FOR TOR TLS CLIENT BINDING AUTH0003",
+                context_key,
+            )
+            .unwrap();
+        buf
+    }
 }
 
 impl Read for TlsConnection {

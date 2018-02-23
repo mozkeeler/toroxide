@@ -2,7 +2,7 @@ use byteorder::{ByteOrder, NetworkEndian, WriteBytesExt};
 use openssl::x509::X509;
 use openssl::sign::Verifier;
 use openssl::hash::MessageDigest;
-use std::io::Read;
+use std::io::{Read, Write};
 
 use keys;
 
@@ -92,6 +92,22 @@ impl Ed25519Cert {
             extensions: Vec::new(),
             signature: Vec::new(),
         }
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        writer.write_u8(1).unwrap();
+        writer.write_u8(self.cert_type.as_u8()).unwrap();
+        writer
+            .write_u32::<NetworkEndian>(self.expiration_date)
+            .unwrap();
+        writer.write_u8(self.certified_key_type.as_u8()).unwrap();
+        writer.write_all(&self.certified_key).unwrap();
+        assert!(self.extensions.len() < 256);
+        writer.write_u8(self.extensions.len() as u8).unwrap();
+        for extension in &self.extensions {
+            extension.write_to(writer);
+        }
+        writer.write_all(&self.signature).unwrap();
     }
 
     pub fn get_tbs_bytes(&self) -> Vec<u8> {
@@ -249,6 +265,10 @@ impl Ed25519CertExtension {
         })
     }
 
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        writer.write_all(&self.as_bytes()).unwrap();
+    }
+
     pub fn as_bytes(&self) -> Vec<u8> {
         let mut bytes: Vec<u8> = Vec::new();
         assert!(self.ext_data.len() < 65536);
@@ -344,6 +364,16 @@ impl Ed25519Identity {
         })
     }
 
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        writer.write_all(&self.ed25519_key).unwrap();
+        writer
+            .write_u32::<NetworkEndian>(self.expiration_date)
+            .unwrap();
+        assert!(self.signature.len() < 256);
+        writer.write_u8(self.signature.len() as u8).unwrap();
+        writer.write_all(&self.signature).unwrap();
+    }
+
     pub fn new(
         ed25519_key: [u8; 32],
         expiration_date: HoursSinceEpoch,
@@ -392,6 +422,10 @@ impl X509Cert {
             return Err("failed to decode x509 cert");
         }
         Ok(x509cert)
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        writer.write_all(&self.der).unwrap();
     }
 
     pub fn is_self_signed(&self) -> bool {

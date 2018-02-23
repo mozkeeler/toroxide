@@ -1,6 +1,7 @@
+use byteorder::{NetworkEndian, WriteBytesExt};
 use std::fmt;
 use std::str;
-use std::io::Read;
+use std::io::{Read, Write};
 
 use certs;
 
@@ -73,6 +74,29 @@ impl Command {
             _ => false,
         }
     }
+
+    fn as_u8(&self) -> u8 {
+        match self {
+            &Command::Padding => 0,
+            &Command::Create => 1,
+            &Command::Created => 2,
+            &Command::Relay => 3,
+            &Command::Destroy => 4,
+            &Command::CreateFast => 5,
+            &Command::CreatedFast => 6,
+            &Command::Netinfo => 8,
+            &Command::RelayEarly => 9,
+            &Command::Create2 => 10,
+            &Command::Created2 => 11,
+            &Command::PaddingNegotiate => 12,
+            &Command::VPadding => 128,
+            &Command::Certs => 129,
+            &Command::AuthChallenge => 130,
+            &Command::Authenticate => 131,
+            &Command::Authorize => 132,
+            &Command::Unknown(value) => value,
+        }
+    }
 }
 
 impl Cell {
@@ -108,6 +132,27 @@ impl Cell {
             payload: payload,
         })
     }
+
+    pub fn new(circ_id: u32, command: Command, payload: Vec<u8>) -> Cell {
+        Cell {
+            circ_id: circ_id,
+            command: command,
+            payload: payload,
+        }
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        writer.write_u32::<NetworkEndian>(self.circ_id).unwrap();
+        writer.write_u8(self.command.as_u8()).unwrap();
+        if self.command.is_variable_length() {
+            assert!(self.payload.len() < 65536);
+            writer
+                .write_u16::<NetworkEndian>(self.payload.len() as u16)
+                .unwrap();
+        }
+        // TODO: pad to PAYLOAD_LEN with 0 bytes for non-variable-length cells
+        writer.write_all(&self.payload).unwrap();
+    }
 }
 
 #[derive(Debug)]
@@ -123,7 +168,7 @@ pub enum CertType {
 }
 
 impl CertType {
-    fn from_utf8(cert_type: u8) -> CertType {
+    fn from_u8(cert_type: u8) -> CertType {
         match cert_type {
             1 => CertType::RsaLink,
             2 => CertType::RsaIdentity,
@@ -133,6 +178,19 @@ impl CertType {
             6 => CertType::Ed25519Authenticate,
             7 => CertType::Ed25519Identity,
             _ => CertType::Unknown(cert_type),
+        }
+    }
+
+    fn as_u8(&self) -> u8 {
+        match self {
+            &CertType::RsaLink => 1,
+            &CertType::RsaIdentity => 2,
+            &CertType::RsaAuthenticate => 3,
+            &CertType::Ed25519Signing => 4,
+            &CertType::Ed25519Link => 5,
+            &CertType::Ed25519Authenticate => 6,
+            &CertType::Ed25519Identity => 7,
+            &CertType::Unknown(value) => value,
         }
     }
 }
@@ -155,7 +213,7 @@ impl RawCert {
         }
         let length = ((two_byte_buf[0] as usize) << 8) + two_byte_buf[1] as usize;
         let mut cert = RawCert {
-            cert_type: CertType::from_utf8(one_byte_buf[0]),
+            cert_type: CertType::from_u8(one_byte_buf[0]),
             bytes: Vec::with_capacity(length),
         };
         cert.bytes.resize(length, 0);
@@ -163,6 +221,22 @@ impl RawCert {
             return Err("failed to read cert bytes");
         }
         Ok(cert)
+    }
+
+    pub fn new(cert_type: CertType, bytes: Vec<u8>) -> RawCert {
+        RawCert {
+            cert_type: cert_type,
+            bytes: bytes,
+        }
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        writer.write_u8(self.cert_type.as_u8()).unwrap();
+        assert!(self.bytes.len() < 65536);
+        writer
+            .write_u16::<NetworkEndian>(self.bytes.len() as u16)
+            .unwrap();
+        writer.write_all(&self.bytes).unwrap();
     }
 }
 
@@ -234,9 +308,21 @@ impl CertsCell {
         }
         certs
     }
+
+    pub fn new_from_raw_certs(certs: Vec<RawCert>) -> CertsCell {
+        CertsCell { certs: certs }
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        assert!(self.certs.len() < 256);
+        writer.write_u8(self.certs.len() as u8).unwrap();
+        for cert in &self.certs {
+            cert.write_to(writer);
+        }
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum AuthType {
     RsaSha256TlsSecret,
     Ed25519Sha256Rfc5705,
@@ -284,6 +370,10 @@ impl AuthChallengeCell {
             auth_challenge_cell.methods.push(AuthType::from_u16(method));
         }
         Ok(auth_challenge_cell)
+    }
+
+    pub fn has_auth_type(&self, auth_type: AuthType) -> bool {
+        self.methods.contains(&auth_type)
     }
 }
 

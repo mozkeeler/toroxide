@@ -148,6 +148,15 @@ impl RsaPublicKey {
     pub fn get_size_in_bits(&self) -> usize {
         self.key.rsa().unwrap().size() as usize * 8
     }
+
+    /// Returns the sha-256 hash of the DER encoding of this key as an ASN.1 RSA public key as
+    /// specified in PKCS #1.
+    pub fn get_sha256_hash(&self) -> Vec<u8> {
+        let bytes = self.key.rsa().unwrap().public_key_to_pem_pkcs1().unwrap();
+        let mut hasher = Hasher::new(MessageDigest::sha256()).unwrap();
+        hasher.update(&bytes).unwrap();
+        (*hasher.finish().unwrap()).to_vec()
+    }
 }
 
 pub struct Ed25519Key {
@@ -173,13 +182,17 @@ impl Ed25519Key {
         //to_be_signed.extend(b"Tor node signing key certificate v1".iter().cloned());
         let mut new_cert = certs::Ed25519Cert::new_unsigned(cert_type, other.key.public.to_bytes());
         to_be_signed.extend(new_cert.get_tbs_bytes());
-        let signature = self.key.sign::<Sha512>(&to_be_signed).to_bytes();
+        let signature = self.sign_data(&to_be_signed);
         new_cert.set_signature(signature);
         new_cert
     }
 
     pub fn get_public_key_bytes(&self) -> [u8; 32] {
         self.key.public.to_bytes()
+    }
+
+    pub fn sign_data(&self, data: &[u8]) -> [u8; 64] {
+        self.key.sign::<Sha512>(data).to_bytes()
     }
 }
 

@@ -322,6 +322,31 @@ impl CertsCell {
     }
 }
 
+pub struct AuthenticateCell {
+    auth_type: AuthType,
+    authentication: Vec<u8>,
+}
+
+impl AuthenticateCell {
+    pub fn new(auth_type: AuthType, authentication: Vec<u8>) -> AuthenticateCell {
+        AuthenticateCell {
+            auth_type: auth_type,
+            authentication: authentication,
+        }
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        writer
+            .write_u16::<NetworkEndian>(self.auth_type.as_u16())
+            .unwrap();
+        assert!(self.authentication.len() < 65536);
+        writer
+            .write_u16::<NetworkEndian>(self.authentication.len() as u16)
+            .unwrap();
+        writer.write_all(&self.authentication).unwrap();
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum AuthType {
     RsaSha256TlsSecret,
@@ -335,6 +360,14 @@ impl AuthType {
             1 => AuthType::RsaSha256TlsSecret,
             3 => AuthType::Ed25519Sha256Rfc5705,
             _ => AuthType::Unknown(auth_type),
+        }
+    }
+
+    fn as_u16(&self) -> u16 {
+        match self {
+            &AuthType::RsaSha256TlsSecret => 1,
+            &AuthType::Ed25519Sha256Rfc5705 => 3,
+            &AuthType::Unknown(value) => value,
         }
     }
 }

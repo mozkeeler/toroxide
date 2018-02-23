@@ -25,6 +25,7 @@ use curve25519_dalek::montgomery;
 use curve25519_dalek::scalar;
 use getopts::Options;
 use hmac::{Hmac, Mac};
+use rand::{OsRng, Rng};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
@@ -122,6 +123,7 @@ fn main() {
     tor_client.read_certs();
     tor_client.read_auth_challenge();
     tor_client.send_certs_and_authenticate_cells();
+    tor_client.read_cell();
 }
 
 fn debug_dump_from_stdin() {
@@ -232,11 +234,94 @@ impl TorClient {
         let mut buf: Vec<u8> = Vec::new();
         certs_cell.write_to(&mut buf);
         let cell = types::Cell::new(0, types::Command::Certs, buf);
-        let mut buf: Vec<u8> = Vec::new();
-        cell.write_to(&mut buf);
-        util::hexdump(&buf);
+        cell.write_to(&mut connection);
+
+        // tor-spec.txt section 4.4.2: With Ed25519-SHA256-RFC5705 link authentication, the
+        // authentication field of the AUTHENTICATE cell is as follows:
+        // "AUTH0003" [8 bytes]
+        // (TODO: these next two are a bit underspecified. Combining section 0.3 with this, I
+        // suppose this means "sha-256 hash of DER encoding of an ASN.1 RSA public key (PKCS #1).)
+        // CID: sha-256 hash of initiator's RSA identity key [32 bytes]
+        // SID: sha-256 hash of responder's RSA identity key [32 bytes]
+        // CID_ED: initiator's Ed25519 identity public key [32 bytes]
+        // SID_ED: responder's Ed25519 identity public key [32 bytes]
+        // SLOG: sha-256 hash of all bytes received from responder by initiator (should be VERSIONS
+        //       cell, CERTS cell, AUTH_CHALLENGE cell, and any padding cells (currently not
+        //       handled...)) [32 bytes]
+        // CLOG: sha-256 hash of all bytes sent to responder by initiator (should be VERSIONS cell,
+        //       CERTS cell, and any padding cells (currently not sent...)) [32 bytes]
+        // SCERT: sha-256 hash of the responder's TLS link certificate [32 bytes]
+        // TLSSECRETS: output from an RFC5705 exporter on the TLS session, using:
+        //             - the label "EXPORTER FOR TOR TLS CLIENT BINDING AUTH0003"
+        //             - the context of the initiator's Ed25519 identity public key
+        //             - output length of 32 bytes
+        //             [32 bytes]
+        // RAND: a 24-byte random value chosen by the initiator [24 bytes]
+        // SIG: a signature over this data using the initiator's Ed25519 authenticate key
+        //      [variable length? (shouldn't it just be 64 bytes?)]
+
+        // "AUTH0003"
+        let mut buf: Vec<u8> = b"AUTH0003".to_vec();
+        // CID
+        let cid = initiator_certs
+            .rsa_identity_cert
+            .get_key()
+            .get_sha256_hash();
+        buf.extend(cid);
+        // SID
+        let responder_certs = match self.responder_certs {
+            Some(ref responder_certs) => responder_certs,
+            None => panic!("invalid state - call read_certs first"),
+        };
+        let sid = responder_certs
+            .rsa_identity_cert
+            .get_key()
+            .get_sha256_hash();
+        buf.extend(sid);
+        // CID_ED
+        let cid_ed = initiator_certs.ed25519_identity_cert.get_key_bytes();
+        buf.extend(cid_ed);
+        // SID_ED
+        let sid_ed = responder_certs.ed25519_identity_cert.get_key_bytes();
+        buf.extend(sid_ed);
+        // SLOG (yes, the responder is first this time. don't know why)
+        let slog = connection.get_read_digest();
+        buf.extend(slog);
+        // CLOG
+        let clog = connection.get_write_digest();
+        buf.extend(clog);
+        // SCERT
+        let scert = connection.get_peer_cert_hash();
+        buf.extend(scert);
+        // TLSSECRETS
         let ed25519_identity_key = initiator_certs.get_ed25519_identity_key();
-        let tls_secrets = connection.get_tls_secrets(&ed25519_identity_key.get_public_key_bytes());
+        let tlssecrets = connection.get_tls_secrets(&ed25519_identity_key.get_public_key_bytes());
+        buf.extend(tlssecrets);
+        // RAND
+        let mut rand = [0; 24];
+        let mut csprng: OsRng = OsRng::new().unwrap();
+        csprng.fill_bytes(&mut rand);
+        buf.extend(rand.iter());
+        // SIG
+        let ed25519_authenticate_key = initiator_certs.get_ed25519_authenticate_key();
+        let signature = ed25519_authenticate_key.sign_data(&buf);
+        buf.extend(signature.iter());
+
+        let authenticate_cell =
+            types::AuthenticateCell::new(types::AuthType::Ed25519Sha256Rfc5705, buf);
+        let mut buf: Vec<u8> = Vec::new();
+        authenticate_cell.write_to(&mut buf);
+        let cell = types::Cell::new(0, types::Command::Authenticate, buf);
+        cell.write_to(&mut connection);
+    }
+
+    fn read_cell(&mut self) {
+        let mut connection = match self.tls_connection {
+            Some(ref mut connection) => connection,
+            None => panic!("invalid state - call connect_to first"),
+        };
+        let cell = types::Cell::read_new(&mut connection).unwrap();
+        println!("{:?}", cell);
     }
 
     fn handle_event(&mut self, event: &String) {
@@ -634,5 +719,9 @@ impl InitiatorCerts {
 
     fn get_ed25519_identity_key(&self) -> &keys::Ed25519Key {
         &self.ed25519_identity_key
+    }
+
+    fn get_ed25519_authenticate_key(&self) -> &keys::Ed25519Key {
+        &self.ed25519_authenticate_key
     }
 }

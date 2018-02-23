@@ -32,6 +32,7 @@ use std::env;
 use std::io::prelude::*;
 use std::io;
 use std::ops::Mul;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 struct TorClient {
     /// Maybe a TLS connection with a peer.
@@ -123,7 +124,8 @@ fn main() {
     tor_client.read_certs();
     tor_client.read_auth_challenge();
     tor_client.send_certs_and_authenticate_cells();
-    tor_client.read_cell();
+    tor_client.read_netinfo();
+    tor_client.create_fast(1);
 }
 
 fn debug_dump_from_stdin() {
@@ -315,6 +317,54 @@ impl TorClient {
         cell.write_to(&mut connection);
     }
 
+    fn read_netinfo(&mut self) {
+        let mut connection = match self.tls_connection {
+            Some(ref mut connection) => connection,
+            None => panic!("invalid state - call connect_to first"),
+        };
+        let cell = types::Cell::read_new(&mut connection).unwrap();
+        println!("{:?}", cell);
+        let netinfo = match cell.command {
+            types::Command::Netinfo => match types::NetinfoCell::read_new(&mut &cell.payload[..]) {
+                Ok(netinfo_cell) => netinfo_cell,
+                Err(msg) => panic!("error decoding NETINFO cell: {}", msg),
+            },
+            _ => panic!("Expected NETINFO, got {:?}", cell.command),
+        };
+        println!("{:?}", netinfo);
+
+        let timestamp: types::EpochSeconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let other_or_address = netinfo.get_other_or_address();
+        let localhost = types::OrAddress::IPv4Address([127, 0, 0, 1]);
+        let netinfo = types::NetinfoCell::new(timestamp, other_or_address, localhost);
+        let mut buf: Vec<u8> = Vec::new();
+        netinfo.write_to(&mut buf);
+        let cell = types::Cell::new(0, types::Command::Netinfo, buf);
+        cell.write_to(&mut connection);
+    }
+
+    fn create_fast(&mut self, circ_id: u32) {
+        let mut x = [0; 20];
+        let mut csprng: OsRng = OsRng::new().unwrap();
+        csprng.fill_bytes(&mut x);
+        let create_fast_cell = types::CreateFastCell::new(x);
+        let mut buf: Vec<u8> = Vec::new();
+        create_fast_cell.write_to(&mut buf);
+        let cell = types::Cell::new(circ_id, types::Command::CreateFast, buf);
+
+        {
+            let mut connection = match self.tls_connection {
+                Some(ref mut connection) => connection,
+                None => panic!("invalid state - call connect_to first"),
+            };
+            cell.write_to(&mut connection);
+        }
+        self.read_cell();
+    }
+
     fn read_cell(&mut self) {
         let mut connection = match self.tls_connection {
             Some(ref mut connection) => connection,
@@ -355,12 +405,14 @@ impl TorClient {
             types::Command::Relay => {
                 self.handle_encrypted_relay_cell(tor_cell.circ_id, direction, &tor_cell.payload);
             }
-            types::Command::Netinfo => match types::NetinfoCell::from_slice(&tor_cell.payload) {
-                Ok(netinfo_cell) => {
-                    println!("{:?}", netinfo_cell);
+            types::Command::Netinfo => {
+                match types::NetinfoCell::read_new(&mut &tor_cell.payload[..]) {
+                    Ok(netinfo_cell) => {
+                        println!("{:?}", netinfo_cell);
+                    }
+                    Err(msg) => println!("{}", msg),
                 }
-                Err(msg) => println!("{}", msg),
-            },
+            }
             types::Command::Create2 => {
                 match types::Create2Cell::from_slice(&tor_cell.payload) {
                     Ok(create2_cell) => {
@@ -677,9 +729,9 @@ impl InitiatorCerts {
         let ed25519_signing_cert = ed25519_identity_key
             .sign_ed25519_key(&ed25519_signing_key, certs::Ed25519CertType::SigningKey);
         let ed25519_authenticate_key = keys::Ed25519Key::new();
-        let ed25519_authenticate_cert = ed25519_identity_key.sign_ed25519_key(
+        let ed25519_authenticate_cert = ed25519_signing_key.sign_ed25519_key(
             &ed25519_authenticate_key,
-            certs::Ed25519CertType::SigningKey,
+            certs::Ed25519CertType::AuthenticationKey,
         );
         InitiatorCerts {
             rsa_identity_key: rsa_identity_key,

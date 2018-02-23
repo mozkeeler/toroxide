@@ -82,14 +82,18 @@ impl Ed25519Cert {
         })
     }
 
-    pub fn new_unsigned(cert_type: Ed25519CertType, certified_key: [u8; 32]) -> Ed25519Cert {
+    pub fn new_unsigned(
+        cert_type: Ed25519CertType,
+        certified_key: [u8; 32],
+        signing_key_bytes: &[u8; 32],
+    ) -> Ed25519Cert {
         Ed25519Cert {
             cert_type: cert_type,
             // I think this is 2050-01-01, but maybe this should be dynamic
             expiration_date: 701288,
             certified_key_type: Ed25519CertifiedKeyType::Ed25519Key,
             certified_key: certified_key,
-            extensions: Vec::new(),
+            extensions: vec![Ed25519CertExtension::new(signing_key_bytes)],
             signature: Vec::new(),
         }
     }
@@ -279,6 +283,16 @@ impl Ed25519CertExtension {
         bytes.push(self.ext_flags.as_u8());
         bytes.extend(self.ext_data.iter());
         bytes
+    }
+
+    pub fn new(ed25519_key_bytes: &[u8; 32]) -> Ed25519CertExtension {
+        let mut ext_data: Vec<u8> = Vec::with_capacity(32);
+        ext_data.extend(ed25519_key_bytes);
+        Ed25519CertExtension {
+            ext_type: Ed25519CertExtensionType::SignedWithEd25519Key,
+            ext_flags: Ed25519CertExtensionFlags::None,
+            ext_data: ext_data,
+        }
     }
 }
 

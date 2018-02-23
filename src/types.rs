@@ -1,4 +1,4 @@
-use byteorder::{NetworkEndian, WriteBytesExt};
+use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::fmt;
 use std::str;
 use std::io::{Read, Write};
@@ -150,8 +150,14 @@ impl Cell {
                 .write_u16::<NetworkEndian>(self.payload.len() as u16)
                 .unwrap();
         }
-        // TODO: pad to PAYLOAD_LEN with 0 bytes for non-variable-length cells
         writer.write_all(&self.payload).unwrap();
+        if !self.command.is_variable_length() {
+            assert!(self.payload.len() <= PAYLOAD_LEN);
+            let padding_length = PAYLOAD_LEN - self.payload.len();
+            let mut zeroes: Vec<u8> = Vec::with_capacity(padding_length);
+            zeroes.resize(padding_length, 0);
+            writer.write_all(&zeroes).unwrap();
+        }
     }
 }
 
@@ -410,52 +416,7 @@ impl AuthChallengeCell {
     }
 }
 
-// Useful for reading something of an unknown size from a slice of bytes and then continuing to read
-// the bytes after that something (where it internally knows how large it is).
-pub struct Cursor<'a> {
-    position: usize,
-    bytes: &'a [u8],
-}
-
-impl<'a> Cursor<'a> {
-    pub fn new(bytes: &'a [u8]) -> Cursor<'a> {
-        Cursor {
-            position: 0,
-            bytes: bytes,
-        }
-    }
-
-    pub fn remaining(&self) -> usize {
-        assert!(self.position <= self.bytes.len());
-        self.bytes.len() - self.position
-    }
-
-    pub fn read_byte(&mut self) -> Result<u8, &'static str> {
-        if self.remaining() < 1 {
-            return Err("input not long enough");
-        }
-        self.position += 1;
-        Ok(self.bytes[self.position - 1])
-    }
-
-    pub fn read_slice(&mut self, length: usize) -> Result<&'a [u8], &'static str> {
-        if self.remaining() < length {
-            return Err("input not long enough");
-        }
-        self.position += length;
-        Ok(&self.bytes[self.position - length..self.position])
-    }
-
-    pub fn advance(&mut self, length: usize) -> Result<(), &'static str> {
-        if self.remaining() < length {
-            return Err("input not long enough");
-        }
-        self.position += length;
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum OrAddress {
     Hostname(String),
     IPv4Address([u8; 4]),
@@ -466,13 +427,16 @@ pub enum OrAddress {
 }
 
 impl OrAddress {
-    pub fn from_cursor(cursor: &mut Cursor) -> Result<OrAddress, &'static str> {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<OrAddress, &'static str> {
         // These are TLV encoded, with one byte each for type and length.
-        let address_type = cursor.read_byte()?;
-        let address_length = cursor.read_byte()?;
+        let address_type = reader.read_u8().unwrap();
+        let address_length = reader.read_u8().unwrap();
         Ok(match address_type {
             0 => {
-                let result = str::from_utf8(cursor.read_slice(address_length as usize)?);
+                let mut buf: Vec<u8> = Vec::with_capacity(address_length as usize);
+                buf.resize(address_length as usize, 0);
+                reader.read_exact(&mut buf).unwrap();
+                let result = String::from_utf8(buf);
                 match result {
                     // TODO vaildate the hostname?
                     Ok(string) => OrAddress::Hostname(string.to_owned()),
@@ -483,67 +447,112 @@ impl OrAddress {
                 if address_length != 4 {
                     return Err("malformed ipv4 in OrAddress");
                 }
-                // there has to be a better way of doing this
                 let mut dest = [0; 4];
-                dest[0] = cursor.read_byte()?;
-                dest[1] = cursor.read_byte()?;
-                dest[2] = cursor.read_byte()?;
-                dest[3] = cursor.read_byte()?;
+                reader.read_exact(&mut dest).unwrap();
                 OrAddress::IPv4Address(dest)
             }
             6 => {
                 if address_length != 16 {
                     return Err("malformed ipv6 in OrAddress");
                 }
-                // there has to be a better way of doing this
                 let mut dest = [0; 16];
-                for i in 0..16 {
-                    dest[i] = cursor.read_byte()?;
-                }
+                reader.read_exact(&mut dest).unwrap();
                 OrAddress::IPv6Address(dest)
             }
             0xf0 => {
-                cursor.advance(address_length as usize)?;
+                // We have to drop these bytes.
+                let mut buf: Vec<u8> = Vec::with_capacity(address_length as usize);
+                buf.resize(address_length as usize, 0);
+                reader.read_exact(&mut buf).unwrap();
                 OrAddress::TransientError
             }
             0xf1 => {
-                cursor.advance(address_length as usize)?;
+                // We have to drop these bytes.
+                let mut buf: Vec<u8> = Vec::with_capacity(address_length as usize);
+                buf.resize(address_length as usize, 0);
+                reader.read_exact(&mut buf).unwrap();
                 OrAddress::NontransientError
             }
-            _ => OrAddress::Unknown(address_type),
+            _ => OrAddress::Unknown(address_type), // TODO: still read the length and value?
         })
     }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        match self {
+            &OrAddress::Hostname(ref string) => {
+                writer.write_u8(0).unwrap();
+                let bytes = string.as_bytes();
+                assert!(bytes.len() < 256);
+                writer.write_u8(bytes.len() as u8).unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            &OrAddress::IPv4Address(bytes) => {
+                writer.write_u8(4).unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+            &OrAddress::IPv6Address(bytes) => {
+                writer.write_u8(6).unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+            _ => panic!("unimplemented"),
+        }
+    }
 }
+
+pub type EpochSeconds = u32;
 
 #[derive(Debug)]
 pub struct NetinfoCell {
     timestamp: u32,
     other_or_address: OrAddress,
-    num_addresses: u8,
     this_or_addresses: Vec<OrAddress>,
 }
 
 impl NetinfoCell {
-    pub fn from_slice(bytes: &[u8]) -> Result<NetinfoCell, &'static str> {
-        if bytes.len() < 4 {
-            return Err("input not long enough for NetinfoCell");
-        }
-        // refactor me, etc.
-        let timestamp = ((bytes[0] as u32) << 24) + ((bytes[1] as u32) << 16)
-            + ((bytes[2] as u32) << 8) + (bytes[3] as u32); // big-endian
-        let mut cursor = Cursor::new(&bytes[4..]);
-        let other_or_address = OrAddress::from_cursor(&mut cursor)?;
-        let num_addresses = cursor.read_byte()?;
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<NetinfoCell, &'static str> {
+        let timestamp = match reader.read_u32::<NetworkEndian>() {
+            Err(_) => return Err("failed to read timestamp"),
+            Ok(timestamp) => timestamp,
+        };
+        let other_or_address = OrAddress::read_new(reader)?;
+        let num_addresses = reader.read_u8().unwrap();
         let mut this_or_addresses = Vec::new();
         for _ in 0..num_addresses {
-            this_or_addresses.push(OrAddress::from_cursor(&mut cursor)?);
+            this_or_addresses.push(OrAddress::read_new(reader)?);
         }
         Ok(NetinfoCell {
             timestamp: timestamp,
             other_or_address: other_or_address,
-            num_addresses: num_addresses,
             this_or_addresses: this_or_addresses,
         })
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        writer.write_u32::<NetworkEndian>(self.timestamp).unwrap();
+        self.other_or_address.write_to(writer);
+        assert!(self.this_or_addresses.len() < 256);
+        writer.write_u8(self.this_or_addresses.len() as u8).unwrap();
+        for address in &self.this_or_addresses {
+            address.write_to(writer);
+        }
+    }
+
+    pub fn new(
+        timestamp: EpochSeconds,
+        other_or_address: OrAddress,
+        this_or_address: OrAddress,
+    ) -> NetinfoCell {
+        NetinfoCell {
+            timestamp: timestamp,
+            other_or_address: other_or_address,
+            this_or_addresses: vec![this_or_address],
+        }
+    }
+
+    /// Returns some `OrAddress` in `this_or_addresses` or panics.
+    /// TODO: make this robust against adversarial input.
+    pub fn get_other_or_address(&self) -> OrAddress {
+        self.this_or_addresses[0].clone()
     }
 }
 
@@ -867,5 +876,36 @@ impl VersionsCell {
         } else {
             Err("no shared versions")
         }
+    }
+}
+
+pub struct CreateFastCell {
+    x: [u8; 20],
+}
+
+impl CreateFastCell {
+    pub fn new(x: [u8; 20]) -> CreateFastCell {
+        CreateFastCell { x: x }
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) {
+        writer.write_all(&self.x).unwrap();
+    }
+}
+
+pub struct CreatedFastCell {
+    y: [u8; 20],
+    kh: [u8; 20],
+}
+
+impl CreatedFastCell {
+    pub fn read_new<R: Read>(reader: &mut R) -> CreatedFastCell {
+        let mut created_fast_cell = CreatedFastCell {
+            y: [0; 20],
+            kh: [0; 20],
+        };
+        reader.read_exact(&mut created_fast_cell.y).unwrap();
+        reader.read_exact(&mut created_fast_cell.kh).unwrap();
+        created_fast_cell
     }
 }

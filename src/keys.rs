@@ -180,7 +180,11 @@ impl Ed25519Key {
         // Yeah so cert-spec.txt section 2.1 is just flat out wrong - there is no prefix and the
         // string "Tor node signing key certificate v1" appears nowhere in the tor codebase.
         //to_be_signed.extend(b"Tor node signing key certificate v1".iter().cloned());
-        let mut new_cert = certs::Ed25519Cert::new_unsigned(cert_type, other.key.public.to_bytes());
+        let mut new_cert = certs::Ed25519Cert::new_unsigned(
+            cert_type,
+            other.key.public.to_bytes(),
+            &self.get_public_key_bytes(),
+        );
         to_be_signed.extend(new_cert.get_tbs_bytes());
         let signature = self.sign_data(&to_be_signed);
         new_cert.set_signature(signature);

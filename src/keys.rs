@@ -152,7 +152,7 @@ impl RsaPublicKey {
     /// Returns the sha-256 hash of the DER encoding of this key as an ASN.1 RSA public key as
     /// specified in PKCS #1.
     pub fn get_sha256_hash(&self) -> Vec<u8> {
-        let bytes = self.key.rsa().unwrap().public_key_to_pem_pkcs1().unwrap();
+        let bytes = self.key.rsa().unwrap().public_key_to_der_pkcs1().unwrap();
         let mut hasher = Hasher::new(MessageDigest::sha256()).unwrap();
         hasher.update(&bytes).unwrap();
         (*hasher.finish().unwrap()).to_vec()

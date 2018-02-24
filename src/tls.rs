@@ -57,8 +57,8 @@ impl TlsConnection {
 
     /// Get the TLSSECRETS bytes ala tor-spec.txt, section 4.4.2.
     /// (RFC5705 exporter using the label "EXPORTER FOR TOR TLS CLIENT BINDING AUTH0003", and the
-    /// given context (specified to be the bytes of the client's Ed25519 identity public key).
-    pub fn get_tls_secrets(&mut self, context_key: &[u8; 32]) -> Vec<u8> {
+    /// given context.
+    pub fn get_tls_secrets(&mut self, context_key: &[u8]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(32);
         buf.resize(32, 0);
         self.stream

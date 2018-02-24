@@ -269,7 +269,7 @@ impl TorClient {
             .rsa_identity_cert
             .get_key()
             .get_sha256_hash();
-        buf.extend(cid);
+        buf.extend(&cid);
         // SID
         let responder_certs = match self.responder_certs {
             Some(ref responder_certs) => responder_certs,
@@ -296,8 +296,9 @@ impl TorClient {
         let scert = connection.get_peer_cert_hash();
         buf.extend(scert);
         // TLSSECRETS
-        let ed25519_identity_key = initiator_certs.get_ed25519_identity_key();
-        let tlssecrets = connection.get_tls_secrets(&ed25519_identity_key.get_public_key_bytes());
+        // tor-spec.txt section 4.4.1 is wrong here - the context is the sha-256 hash of the
+        // initiator's RSA identity cert (in other words, CID)
+        let tlssecrets = connection.get_tls_secrets(&cid);
         buf.extend(tlssecrets);
         // RAND
         let mut rand = [0; 24];
@@ -767,10 +768,6 @@ impl InitiatorCerts {
         ));
 
         types::CertsCell::new_from_raw_certs(certs)
-    }
-
-    fn get_ed25519_identity_key(&self) -> &keys::Ed25519Key {
-        &self.ed25519_identity_key
     }
 
     fn get_ed25519_authenticate_key(&self) -> &keys::Ed25519Key {

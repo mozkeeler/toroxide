@@ -101,12 +101,10 @@ impl Command {
 
 impl Cell {
     pub fn read_new<R: Read>(reader: &mut R) -> Result<Cell, &'static str> {
-        let mut four_byte_buf: [u8; 4] = [0; 4];
-        if let Err(_) = reader.read_exact(&mut four_byte_buf) {
-            return Err("failed to read CircID");
-        }
-        let circ_id = ((four_byte_buf[0] as u32) << 24) + ((four_byte_buf[1] as u32) << 16)
-            + ((four_byte_buf[2] as u32) << 8) + (four_byte_buf[3] as u32); // endian-ness?
+        let circ_id = match reader.read_u32::<NetworkEndian>() {
+            Ok(circ_id) => circ_id,
+            Err(_) => return Err("failed to read circ_id"),
+        };
         let mut one_byte_buf = [0; 1];
         if let Err(_) = reader.read_exact(&mut one_byte_buf) {
             return Err("failed to read command");
@@ -893,6 +891,7 @@ impl CreateFastCell {
     }
 }
 
+#[derive(Debug)]
 pub struct CreatedFastCell {
     y: [u8; 20],
     kh: [u8; 20],
@@ -907,5 +906,13 @@ impl CreatedFastCell {
         reader.read_exact(&mut created_fast_cell.y).unwrap();
         reader.read_exact(&mut created_fast_cell.kh).unwrap();
         created_fast_cell
+    }
+
+    pub fn get_y(&self) -> &[u8; 20] {
+        &self.y
+    }
+
+    pub fn get_kh(&self) -> &[u8; 20] {
+        &self.kh
     }
 }

@@ -10,6 +10,7 @@ extern crate hex;
 extern crate hmac;
 extern crate openssl;
 extern crate rand;
+extern crate sha1;
 extern crate sha2;
 
 mod certs;
@@ -26,8 +27,9 @@ use curve25519_dalek::scalar;
 use getopts::Options;
 use hmac::{Hmac, Mac};
 use rand::{OsRng, Rng};
+use sha1::Sha1;
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::prelude::*;
 use std::io;
@@ -41,10 +43,12 @@ struct TorClient {
     ntor_contexts: HashMap<u32, NtorContext>,
     /// Created NtorContext that we don't know what circuit id it's for yet
     pending_ntor_context: Option<NtorContext>,
-    /// Map of circuit id to NtorKeys
-    ntor_keys: HashMap<u32, NtorKeys>,
+    /// Map of circuit id to CircuitKeys
+    ntor_keys: HashMap<u32, CircuitKeys>,
     /// Maybe the certs parsed and validated from a peer's CERTS cell
     responder_certs: Option<ResponderCerts>,
+    /// A set indicating the circuit IDs that have been used.
+    used_circ_ids: HashSet<u32>,
 }
 
 #[allow(non_snake_case)]
@@ -73,7 +77,7 @@ impl AesContext {
     }
 }
 
-struct NtorKeys {
+struct CircuitKeys {
     forward_digest: [u8; 20],
     backward_digest: [u8; 20],
     forward_key: AesContext,
@@ -81,9 +85,9 @@ struct NtorKeys {
     // KH in hidden service protocol? (doesn't appear to be implemented...?)
 }
 
-impl NtorKeys {
-    fn new(k: &[u8]) -> NtorKeys {
-        NtorKeys {
+impl CircuitKeys {
+    fn new(k: &[u8]) -> CircuitKeys {
+        CircuitKeys {
             forward_digest: slice_to_20_byte_array(&k[0..20]),
             backward_digest: slice_to_20_byte_array(&k[20..40]),
             forward_key: AesContext::new(&k[40..56]),
@@ -125,7 +129,7 @@ fn main() {
     tor_client.read_auth_challenge();
     tor_client.send_certs_and_authenticate_cells();
     tor_client.read_netinfo();
-    tor_client.create_fast(1);
+    tor_client.create_fast();
 }
 
 fn debug_dump_from_stdin() {
@@ -154,6 +158,7 @@ impl TorClient {
             pending_ntor_context: None,
             ntor_keys: HashMap::new(),
             responder_certs: None,
+            used_circ_ids: HashSet::new(),
         }
     }
 
@@ -347,23 +352,32 @@ impl TorClient {
         cell.write_to(&mut connection);
     }
 
-    fn create_fast(&mut self, circ_id: u32) {
+    fn create_fast(&mut self) {
         let mut x = [0; 20];
         let mut csprng: OsRng = OsRng::new().unwrap();
         csprng.fill_bytes(&mut x);
         let create_fast_cell = types::CreateFastCell::new(x);
         let mut buf: Vec<u8> = Vec::new();
         create_fast_cell.write_to(&mut buf);
+        let circ_id = self.get_new_circ_id();
         let cell = types::Cell::new(circ_id, types::Command::CreateFast, buf);
 
-        {
-            let mut connection = match self.tls_connection {
-                Some(ref mut connection) => connection,
-                None => panic!("invalid state - call connect_to first"),
-            };
-            cell.write_to(&mut connection);
-        }
-        self.read_cell();
+        let mut connection = match self.tls_connection {
+            Some(ref mut connection) => connection,
+            None => panic!("invalid state - call connect_to first"),
+        };
+        cell.write_to(&mut connection);
+        let cell = types::Cell::read_new(&mut connection).unwrap();
+        println!("{:?}", cell);
+        match cell.command {
+            types::Command::CreatedFast => {
+                let created_fast = types::CreatedFastCell::read_new(&mut &cell.payload[..]);
+                println!("{:?}", created_fast);
+                let circuit_keys = tor_kdf(&x, created_fast.get_y(), created_fast.get_kh());
+            }
+            types::Command::Destroy => println!("got DESTROY cell"),
+            _ => panic!("Expected CREATED_FAST or DESTROY, got {:?}", cell.command),
+        };
     }
 
     fn read_cell(&mut self) {
@@ -533,6 +547,23 @@ impl TorClient {
             circ_id, direction, relay_cell
         );
     }
+
+    /// Generates a new, nonzero, random circuit id that hasn't been used before or panics.
+    fn get_new_circ_id(&mut self) -> u32 {
+        const RETRY_LIMIT: usize = 1024;
+        let mut csprng: OsRng = OsRng::new().unwrap();
+        let mut retries = RETRY_LIMIT;
+        while retries > 0 {
+            // We need to set the highest bit because we're initiating the connection.
+            let new_circ_id: u32 = csprng.gen::<u32>() | 0x8000_0000;
+            // HashSet.insert returns true if the value was not already present and false otherwise.
+            if self.used_circ_ids.insert(new_circ_id) {
+                return new_circ_id;
+            }
+            retries -= 1;
+        }
+        panic!("couldn't generate new circuit id. (maybe implement gc?)");
+    }
 }
 
 // Ok there has to be a way to do this more generically.
@@ -561,7 +592,8 @@ fn ntor_hmac(input: &[u8], context: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn compute_ntor_keys(key_seed: &[u8]) -> NtorKeys {
+// TODO: maybe rename this function (tor-spec.txt section 5.2.2. KDF-RFC5869)
+fn compute_ntor_keys(key_seed: &[u8]) -> CircuitKeys {
     // We need to generate:
     // HASH_LEN bytes (forward digest)
     // HASH_LEN bytes (backward digest)
@@ -600,7 +632,7 @@ fn compute_ntor_keys(key_seed: &[u8]) -> NtorKeys {
     k.write_all(&k_1).unwrap();
     k.write_all(&k_2).unwrap();
     k.write_all(&k_3).unwrap();
-    NtorKeys::new(&k)
+    CircuitKeys::new(&k)
 }
 
 /// Represents the certs that are supposed to be present in a responder's CERTS cell.
@@ -772,5 +804,58 @@ impl InitiatorCerts {
 
     fn get_ed25519_authenticate_key(&self) -> &keys::Ed25519Key {
         &self.ed25519_authenticate_key
+    }
+}
+
+/// Implements KDF-TOR as specified by tor-spec.txt section 5.2.1 in the context of a CREATE FAST
+/// handshake. The TAP handshake is not implemented.
+/// Given K0 as `x` and `y` concatenated together, computes
+/// K = H(K0 | [00]) | H(K0 | [01]) | H(K0 | [02]) | ...
+/// where H is SHA-1 (?), '|' indicated concatenation, and [XX] is a byte of the indicated value.
+/// The first 20 bytes should equal the given `kh` (this demonstrates that the server knows `x`).
+/// The next 20 bytes are the forward digest. The next 20 bytes are the backward digest. The next
+/// 16 bytes are the forward encryption key. The next 16 bytes are the backward encryption key.
+/// In total, 92 bytes of K need to be generated, which means 5 blocks in total (the last 8 bytes
+/// are discarded).
+fn tor_kdf(x: &[u8; 20], y: &[u8; 20], kh: &[u8; 20]) -> CircuitKeys {
+    let mut k0: Vec<u8> = Vec::with_capacity(40);
+    k0.extend(x.iter());
+    k0.extend(y.iter());
+
+    let mut hash = Sha1::new();
+    hash.update(&k0);
+    hash.update(&[0]);
+    let kh_calculated = hash.digest().bytes();
+    if !constant_time_eq(&kh_calculated, kh) {
+        println!("didn't get the same kh?");
+        util::hexdump(kh);
+        util::hexdump(&kh_calculated);
+    }
+
+    let mut hash = Sha1::new();
+    hash.update(&k0);
+    hash.update(&[1]);
+    let forward_digest = hash.digest().bytes();
+
+    let mut hash = Sha1::new();
+    hash.update(&k0);
+    hash.update(&[2]);
+    let backward_digest = hash.digest().bytes();
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut hash = Sha1::new();
+    hash.update(&k0);
+    hash.update(&[3]);
+    buffer.extend(hash.digest().bytes().iter());
+    let mut hash = Sha1::new();
+    hash.update(&k0);
+    hash.update(&[4]);
+    buffer.extend(hash.digest().bytes().iter());
+
+    CircuitKeys {
+        forward_digest: forward_digest,
+        backward_digest: backward_digest,
+        forward_key: AesContext::new(&buffer[0..16]),
+        backward_key: AesContext::new(&buffer[16..32]),
     }
 }

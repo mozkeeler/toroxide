@@ -1,7 +1,6 @@
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::fmt;
-use std::str;
-use std::io::{Read, Write};
+use std::io::{Error, ErrorKind, Read, Result, Write};
 
 use certs;
 
@@ -100,30 +99,19 @@ impl Command {
 }
 
 impl Cell {
-    pub fn read_new<R: Read>(reader: &mut R) -> Result<Cell, &'static str> {
-        let circ_id = match reader.read_u32::<NetworkEndian>() {
-            Ok(circ_id) => circ_id,
-            Err(_) => return Err("failed to read circ_id"),
-        };
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<Cell> {
+        let circ_id = reader.read_u32::<NetworkEndian>()?;
         let mut one_byte_buf = [0; 1];
-        if let Err(_) = reader.read_exact(&mut one_byte_buf) {
-            return Err("failed to read command");
-        }
+        reader.read_exact(&mut one_byte_buf)?;
         let command = Command::from_u8(one_byte_buf[0]);
         let length = if command.is_variable_length() {
-            let mut two_byte_buf = [0; 2];
-            if let Err(_) = reader.read_exact(&mut two_byte_buf) {
-                return Err("failed to read variable cell length");
-            }
-            ((two_byte_buf[0] as usize) << 8) + two_byte_buf[1] as usize
+            reader.read_u16::<NetworkEndian>()? as usize
         } else {
             PAYLOAD_LEN
         };
         let mut payload: Vec<u8> = Vec::with_capacity(length);
         payload.resize(length, 0);
-        if let Err(_) = reader.read_exact(payload.as_mut_slice()) {
-            return Err("failed to read payload");
-        }
+        reader.read_exact(payload.as_mut_slice())?;
         Ok(Cell {
             circ_id: circ_id,
             command: command,
@@ -139,23 +127,22 @@ impl Cell {
         }
     }
 
-    pub fn write_to<W: Write>(&self, writer: &mut W) {
-        writer.write_u32::<NetworkEndian>(self.circ_id).unwrap();
-        writer.write_u8(self.command.as_u8()).unwrap();
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_u32::<NetworkEndian>(self.circ_id)?;
+        writer.write_u8(self.command.as_u8())?;
         if self.command.is_variable_length() {
             assert!(self.payload.len() < 65536);
-            writer
-                .write_u16::<NetworkEndian>(self.payload.len() as u16)
-                .unwrap();
+            writer.write_u16::<NetworkEndian>(self.payload.len() as u16)?;
         }
-        writer.write_all(&self.payload).unwrap();
+        writer.write_all(&self.payload)?;
         if !self.command.is_variable_length() {
             assert!(self.payload.len() <= PAYLOAD_LEN);
             let padding_length = PAYLOAD_LEN - self.payload.len();
             let mut zeroes: Vec<u8> = Vec::with_capacity(padding_length);
             zeroes.resize(padding_length, 0);
-            writer.write_all(&zeroes).unwrap();
+            writer.write_all(&zeroes)?;
         }
+        Ok(())
     }
 }
 
@@ -206,24 +193,15 @@ pub struct RawCert {
 }
 
 impl RawCert {
-    pub fn read_new<R: Read>(reader: &mut R) -> Result<RawCert, &'static str> {
-        let mut one_byte_buf = [0; 1];
-        if let Err(_) = reader.read_exact(&mut one_byte_buf) {
-            return Err("failed to read cert type");
-        }
-        let mut two_byte_buf = [0; 2];
-        if let Err(_) = reader.read_exact(&mut two_byte_buf) {
-            return Err("failed to read cert length");
-        }
-        let length = ((two_byte_buf[0] as usize) << 8) + two_byte_buf[1] as usize;
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<RawCert> {
+        let cert_type_byte = reader.read_u8()?;
+        let length = reader.read_u16::<NetworkEndian>()? as usize;
         let mut cert = RawCert {
-            cert_type: CertType::from_u8(one_byte_buf[0]),
+            cert_type: CertType::from_u8(cert_type_byte),
             bytes: Vec::with_capacity(length),
         };
         cert.bytes.resize(length, 0);
-        if let Err(_) = reader.read_exact(cert.bytes.as_mut_slice()) {
-            return Err("failed to read cert bytes");
-        }
+        reader.read_exact(cert.bytes.as_mut_slice())?;
         Ok(cert)
     }
 
@@ -234,13 +212,11 @@ impl RawCert {
         }
     }
 
-    pub fn write_to<W: Write>(&self, writer: &mut W) {
-        writer.write_u8(self.cert_type.as_u8()).unwrap();
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_u8(self.cert_type.as_u8())?;
         assert!(self.bytes.len() < 65536);
-        writer
-            .write_u16::<NetworkEndian>(self.bytes.len() as u16)
-            .unwrap();
-        writer.write_all(&self.bytes).unwrap();
+        writer.write_u16::<NetworkEndian>(self.bytes.len() as u16)?;
+        writer.write_all(&self.bytes)
     }
 }
 
@@ -250,13 +226,10 @@ pub struct CertsCell {
 }
 
 impl CertsCell {
-    pub fn read_new<R: Read>(reader: &mut R) -> Result<CertsCell, &'static str> {
-        let mut one_byte_buf = [0; 1];
-        if let Err(_) = reader.read_exact(&mut one_byte_buf) {
-            return Err("failed to read number of certs");
-        }
-        let mut certs: Vec<RawCert> = Vec::with_capacity(one_byte_buf[0] as usize);
-        for _ in 0..one_byte_buf[0] {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<CertsCell> {
+        let num_certs = reader.read_u8()?;
+        let mut certs: Vec<RawCert> = Vec::with_capacity(num_certs as usize);
+        for _ in 0..num_certs {
             let cert = RawCert::read_new(reader)?;
             certs.push(cert);
         }
@@ -268,6 +241,7 @@ impl CertsCell {
         let mut certs: Vec<certs::Cert> = Vec::new();
         for cert in &self.certs {
             // Obviously this should be refactored into certs::read_new...
+            // Hmmm. This seems less obvious to me now.
             match cert.cert_type {
                 CertType::RsaLink => match certs::X509Cert::read_new(&mut &cert.bytes[..]) {
                     Ok(cert) => certs.push(certs::Cert::RsaLink(cert)),
@@ -317,12 +291,13 @@ impl CertsCell {
         CertsCell { certs: certs }
     }
 
-    pub fn write_to<W: Write>(&self, writer: &mut W) {
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
         assert!(self.certs.len() < 256);
-        writer.write_u8(self.certs.len() as u8).unwrap();
+        writer.write_u8(self.certs.len() as u8)?;
         for cert in &self.certs {
-            cert.write_to(writer);
+            cert.write_to(writer)?;
         }
+        Ok(())
     }
 }
 
@@ -339,15 +314,11 @@ impl AuthenticateCell {
         }
     }
 
-    pub fn write_to<W: Write>(&self, writer: &mut W) {
-        writer
-            .write_u16::<NetworkEndian>(self.auth_type.as_u16())
-            .unwrap();
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_u16::<NetworkEndian>(self.auth_type.as_u16())?;
         assert!(self.authentication.len() < 65536);
-        writer
-            .write_u16::<NetworkEndian>(self.authentication.len() as u16)
-            .unwrap();
-        writer.write_all(&self.authentication).unwrap();
+        writer.write_u16::<NetworkEndian>(self.authentication.len() as u16)?;
+        writer.write_all(&self.authentication)
     }
 }
 
@@ -383,27 +354,16 @@ pub struct AuthChallengeCell {
 }
 
 impl AuthChallengeCell {
-    pub fn read_new<R: Read>(reader: &mut R) -> Result<AuthChallengeCell, &'static str> {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<AuthChallengeCell> {
         let mut auth_challenge_cell = AuthChallengeCell {
             challenge: [0; 32],
             methods: Vec::new(),
         };
-        if let Err(_) = reader.read_exact(&mut auth_challenge_cell.challenge) {
-            return Err("failed to read challenge bytes");
-        }
-        let mut two_byte_buf = [0; 2];
-        if let Err(_) = reader.read_exact(&mut two_byte_buf) {
-            return Err("failed to read number of methods");
-        }
-        // There's only two methods possible.
-        if two_byte_buf[0] != 0 || two_byte_buf[1] > 2 || two_byte_buf[1] == 0 {
-            return Err("invalid number of methods");
-        }
-        for _ in 0..two_byte_buf[1] {
-            if let Err(_) = reader.read_exact(&mut two_byte_buf) {
-                return Err("failed to read method");
-            }
-            let method: u16 = ((two_byte_buf[0] as u16) << 8) + two_byte_buf[1] as u16;
+        reader.read_exact(&mut auth_challenge_cell.challenge)?;
+        let num_methods = reader.read_u16::<NetworkEndian>()?;
+        // There are only two methods possible. Should we validate this?
+        for _ in 0..num_methods {
+            let method = reader.read_u16::<NetworkEndian>()?;
             auth_challenge_cell.methods.push(AuthType::from_u16(method));
         }
         Ok(auth_challenge_cell)
@@ -425,72 +385,65 @@ pub enum OrAddress {
 }
 
 impl OrAddress {
-    pub fn read_new<R: Read>(reader: &mut R) -> Result<OrAddress, &'static str> {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<OrAddress> {
         // These are TLV encoded, with one byte each for type and length.
-        let address_type = reader.read_u8().unwrap();
-        let address_length = reader.read_u8().unwrap();
+        let address_type = reader.read_u8()?;
+        let address_length = reader.read_u8()?;
         Ok(match address_type {
             0 => {
                 let mut buf: Vec<u8> = Vec::with_capacity(address_length as usize);
                 buf.resize(address_length as usize, 0);
-                reader.read_exact(&mut buf).unwrap();
-                let result = String::from_utf8(buf);
-                match result {
-                    // TODO vaildate the hostname?
-                    Ok(string) => OrAddress::Hostname(string.to_owned()),
-                    Err(_) => return Err("invalid hostname"),
-                }
+                reader.read_exact(&mut buf)?;
+                let result = match String::from_utf8(buf) {
+                    Ok(string) => string,
+                    Err(e) => return Err(Error::new(ErrorKind::InvalidData, e)),
+                };
+                OrAddress::Hostname(result.to_owned())
             }
             4 => {
-                if address_length != 4 {
-                    return Err("malformed ipv4 in OrAddress");
-                }
                 let mut dest = [0; 4];
-                reader.read_exact(&mut dest).unwrap();
+                reader.read_exact(&mut dest)?;
                 OrAddress::IPv4Address(dest)
             }
             6 => {
-                if address_length != 16 {
-                    return Err("malformed ipv6 in OrAddress");
-                }
                 let mut dest = [0; 16];
-                reader.read_exact(&mut dest).unwrap();
+                reader.read_exact(&mut dest)?;
                 OrAddress::IPv6Address(dest)
             }
             0xf0 => {
                 // We have to drop these bytes.
                 let mut buf: Vec<u8> = Vec::with_capacity(address_length as usize);
                 buf.resize(address_length as usize, 0);
-                reader.read_exact(&mut buf).unwrap();
+                reader.read_exact(&mut buf)?;
                 OrAddress::TransientError
             }
             0xf1 => {
                 // We have to drop these bytes.
                 let mut buf: Vec<u8> = Vec::with_capacity(address_length as usize);
                 buf.resize(address_length as usize, 0);
-                reader.read_exact(&mut buf).unwrap();
+                reader.read_exact(&mut buf)?;
                 OrAddress::NontransientError
             }
             _ => OrAddress::Unknown(address_type), // TODO: still read the length and value?
         })
     }
 
-    pub fn write_to<W: Write>(&self, writer: &mut W) {
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
         match self {
             &OrAddress::Hostname(ref string) => {
-                writer.write_u8(0).unwrap();
+                writer.write_u8(0)?;
                 let bytes = string.as_bytes();
                 assert!(bytes.len() < 256);
-                writer.write_u8(bytes.len() as u8).unwrap();
-                writer.write_all(bytes).unwrap();
+                writer.write_u8(bytes.len() as u8)?;
+                writer.write_all(bytes)
             }
             &OrAddress::IPv4Address(bytes) => {
-                writer.write_u8(4).unwrap();
-                writer.write_all(&bytes).unwrap();
+                writer.write_u8(4)?;
+                writer.write_all(&bytes)
             }
             &OrAddress::IPv6Address(bytes) => {
-                writer.write_u8(6).unwrap();
-                writer.write_all(&bytes).unwrap();
+                writer.write_u8(6)?;
+                writer.write_all(&bytes)
             }
             _ => panic!("unimplemented"),
         }
@@ -507,13 +460,10 @@ pub struct NetinfoCell {
 }
 
 impl NetinfoCell {
-    pub fn read_new<R: Read>(reader: &mut R) -> Result<NetinfoCell, &'static str> {
-        let timestamp = match reader.read_u32::<NetworkEndian>() {
-            Err(_) => return Err("failed to read timestamp"),
-            Ok(timestamp) => timestamp,
-        };
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<NetinfoCell> {
+        let timestamp = reader.read_u32::<NetworkEndian>()?;
         let other_or_address = OrAddress::read_new(reader)?;
-        let num_addresses = reader.read_u8().unwrap();
+        let num_addresses = reader.read_u8()?;
         let mut this_or_addresses = Vec::new();
         for _ in 0..num_addresses {
             this_or_addresses.push(OrAddress::read_new(reader)?);
@@ -525,14 +475,15 @@ impl NetinfoCell {
         })
     }
 
-    pub fn write_to<W: Write>(&self, writer: &mut W) {
-        writer.write_u32::<NetworkEndian>(self.timestamp).unwrap();
-        self.other_or_address.write_to(writer);
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_u32::<NetworkEndian>(self.timestamp)?;
+        self.other_or_address.write_to(writer)?;
         assert!(self.this_or_addresses.len() < 256);
-        writer.write_u8(self.this_or_addresses.len() as u8).unwrap();
+        writer.write_u8(self.this_or_addresses.len() as u8)?;
         for address in &self.this_or_addresses {
-            address.write_to(writer);
+            address.write_to(writer)?;
         }
+        Ok(())
     }
 
     pub fn new(
@@ -554,13 +505,13 @@ impl NetinfoCell {
     }
 }
 
-pub struct RelayCell<'a> {
+pub struct RelayCell {
     relay_command: RelayCommand,
     recognized: u16,
     stream_id: u16,
     digest: u32,
     length: u16,
-    data: &'a [u8],
+    data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -606,38 +557,26 @@ impl RelayCommand {
     }
 }
 
-pub enum RelayCellError {
-    Unrecognized,
-    InsufficientLength,
-    InsufficientPayloadLength,
-}
-
-impl<'a> RelayCell<'a> {
+impl RelayCell {
     // Maybe pass expected digest here so we can validate that too?
     // (as is this can erroneously be "recognized" 1/256^2 of the time)
-    pub fn from_slice(bytes: &[u8]) -> Result<RelayCell, RelayCellError> {
-        if bytes.len() < PAYLOAD_LEN {
-            return Err(RelayCellError::InsufficientLength);
-        }
-        let relay_command = RelayCommand::from_u8(bytes[0]);
-        // TODO: not this
-        let recognized = ((bytes[1] as u16) << 8) + (bytes[2] as u16);
-        if recognized != 0 as u16 {
-            return Err(RelayCellError::Unrecognized);
-        }
-        let stream_id = ((bytes[3] as u16) << 8) + (bytes[4] as u16);
-        // endian-ness?
-        let digest = ((bytes[6] as u32) << 24) + ((bytes[7] as u32) << 16)
-            + ((bytes[8] as u32) << 8) + (bytes[9] as u32);
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<RelayCell> {
+        let relay_command_byte = reader.read_u8()?;
+        let relay_command = RelayCommand::from_u8(relay_command_byte);
+        let recognized = reader.read_u16::<NetworkEndian>()?;
+        let stream_id = reader.read_u16::<NetworkEndian>()?;
+        let digest = reader.read_u32::<NetworkEndian>()?;
         // This isn't making much sense to me. For DATA cells, the length field doesn't seem to
         // correspond to... anything?
-        let length = ((bytes[10] as u16) << 8) + (bytes[11] as u16);
-        let data_length = if length < (PAYLOAD_LEN - 11) as u16 {
-            length
+        let length = reader.read_u16::<NetworkEndian>()?;
+        let data_length = if (length as usize) < PAYLOAD_LEN - 11 {
+            length as usize
         } else {
-            (PAYLOAD_LEN - 11) as u16
+            PAYLOAD_LEN - 11
         };
-        let data = &bytes[11..11 + data_length as usize];
+        let mut data: Vec<u8> = Vec::with_capacity(data_length);
+        data.resize(data_length, 0);
+        reader.read_exact(&mut data)?;
         Ok(RelayCell {
             relay_command: relay_command,
             recognized: recognized,
@@ -649,14 +588,14 @@ impl<'a> RelayCell<'a> {
     }
 }
 
-impl<'a> fmt::Display for RelayCell<'a> {
+impl fmt::Display for RelayCell {
     fn fmt(&self, dest: &mut fmt::Formatter) -> fmt::Result {
         write!(
             dest,
             "RelayCell {{ {:?} {} {} {} {} ",
             self.relay_command, self.recognized, self.stream_id, self.digest, self.length
         )?;
-        for b in self.data {
+        for b in &self.data {
             write!(dest, "{:02x}", b)?;
         }
         write!(dest, " }}")
@@ -683,31 +622,26 @@ impl ClientHandshakeType {
 }
 
 #[derive(Debug)]
-pub struct Create2Cell<'a> {
+pub struct Create2Cell {
     h_type: ClientHandshakeType,
     h_len: u16,
-    pub h_data: &'a [u8],
+    pub h_data: Vec<u8>,
 }
 
-impl<'a> Create2Cell<'a> {
-    pub fn from_slice(bytes: &[u8]) -> Result<Create2Cell, &'static str> {
-        if bytes.len() < 4 {
-            return Err("input not long enough for Create2Cell");
-        }
-        let h_type_raw = ((bytes[0] as u16) << 8) + (bytes[1] as u16);
-        let h_len = ((bytes[2] as u16) << 8) + (bytes[3] as u16);
-        if bytes.len() < 4 + h_len as usize {
-            return Err("input not long enough for specified length in Create2Cell");
-        }
+impl Create2Cell {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<Create2Cell> {
+        let h_type_raw = reader.read_u16::<NetworkEndian>()?;
+        let h_len = reader.read_u16::<NetworkEndian>()?;
+        let mut h_data: Vec<u8> = Vec::with_capacity(h_len as usize);
+        h_data.resize(h_len as usize, 0);
+        reader.read_exact(&mut h_data)?;
         Ok(Create2Cell {
             h_type: ClientHandshakeType::from_u16(h_type_raw),
             h_len: h_len,
-            h_data: &bytes[4..4 + h_len as usize],
+            h_data: h_data,
         })
     }
 }
-
-const NTOR_CLIENT_HANDSHAKE_SIZE: usize = 84;
 
 #[derive(Debug)]
 pub struct NtorClientHandshake {
@@ -717,50 +651,37 @@ pub struct NtorClientHandshake {
 }
 
 impl NtorClientHandshake {
-    pub fn from_slice(bytes: &[u8]) -> Result<NtorClientHandshake, &'static str> {
-        if bytes.len() != NTOR_CLIENT_HANDSHAKE_SIZE {
-            return Err("incorrect input size for ntor client handshake");
-        }
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<NtorClientHandshake> {
         let mut handshake = NtorClientHandshake {
             node_id: [0; 20],
             key_id: [0; 32],
             client_pk: [0; 32],
         };
-        // ugh there has to be a better way to do this...
-        for i in 0..20 {
-            handshake.node_id[i] = bytes[i];
-        }
-        for i in 0..32 {
-            handshake.key_id[i] = bytes[20 + i];
-            handshake.client_pk[i] = bytes[52 + i];
-        }
+        reader.read_exact(&mut handshake.node_id)?;
+        reader.read_exact(&mut handshake.key_id)?;
+        reader.read_exact(&mut handshake.client_pk)?;
         Ok(handshake)
     }
 }
 
 #[derive(Debug)]
-pub struct Created2Cell<'a> {
+pub struct Created2Cell {
     h_len: u16,
-    pub h_data: &'a [u8],
+    pub h_data: Vec<u8>,
 }
 
-impl<'a> Created2Cell<'a> {
-    pub fn from_slice(bytes: &[u8]) -> Result<Created2Cell, &'static str> {
-        if bytes.len() < 2 {
-            return Err("input not long enough for Created2Cell");
-        }
-        let h_len = ((bytes[0] as u16) << 8) + (bytes[1] as u16);
-        if bytes.len() < 2 + h_len as usize {
-            return Err("input not long enough for specified length in Created2Cell");
-        }
+impl Created2Cell {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<Created2Cell> {
+        let h_len = reader.read_u16::<NetworkEndian>()?;
+        let mut h_data: Vec<u8> = Vec::with_capacity(h_len as usize);
+        h_data.resize(h_len as usize, 0);
+        reader.read_exact(&mut h_data)?;
         Ok(Created2Cell {
             h_len: h_len,
-            h_data: &bytes[2..2 + h_len as usize],
+            h_data: h_data,
         })
     }
 }
-
-const NTOR_SERVER_HANDSHAKE_SIZE: usize = 64;
 
 #[derive(Debug)]
 pub struct NtorServerHandshake {
@@ -769,37 +690,30 @@ pub struct NtorServerHandshake {
 }
 
 impl NtorServerHandshake {
-    pub fn from_slice(bytes: &[u8]) -> Result<NtorServerHandshake, &'static str> {
-        if bytes.len() != NTOR_SERVER_HANDSHAKE_SIZE {
-            return Err("incorrect input size for ntor client handshake");
-        }
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<NtorServerHandshake> {
         let mut handshake = NtorServerHandshake {
             server_pk: [0; 32],
             auth: [0; 32],
         };
-        // ugh there has to be a better way to do this...
-        for i in 0..32 {
-            handshake.server_pk[i] = bytes[i];
-            handshake.auth[i] = bytes[32 + i];
-        }
+        reader.read_exact(&mut handshake.server_pk)?;
+        reader.read_exact(&mut handshake.auth)?;
         Ok(handshake)
     }
 }
 
 #[derive(Debug)]
 pub struct VersionsCell {
-    // Technically they're 2 bytes on the wire, but since only versions 1-5 are defined, u8 works.
-    versions: Vec<u8>,
+    versions: Vec<u16>,
 }
 
 impl VersionsCell {
-    pub fn new(versions: Vec<u8>) -> VersionsCell {
+    pub fn new(versions: Vec<u16>) -> VersionsCell {
         // we really only support v3, 4, 5 (and we really don't do much validation...)
         assert!(versions.len() < 3);
         VersionsCell { versions: versions }
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
         // a VERSIONS cell is variable-length and has CIRCID_LEN equal to 2.
         // Thus:
         // CircID     [2 bytes]
@@ -807,52 +721,36 @@ impl VersionsCell {
         // Length     [2 bytes]
         // Payload    [Length bytes]
         // (where the payload is a sequence of 2-byte big-endian version numbers)
-        let mut bytes: Vec<u8> = Vec::new();
         // I think CircID is supposed to be 0, but it's unclear if that's specified.
-        bytes.push(0);
-        bytes.push(0);
+        writer.write_u16::<NetworkEndian>(0)?;
         // 7 is VERSIONS
-        bytes.push(7);
+        writer.write_u8(7)?;
         // Payload is 2 bytes.
-        bytes.push(0);
-        assert!(self.versions.len() < 128);
-        bytes.push((self.versions.len() * 2) as u8);
+        assert!(self.versions.len() < 65536);
+        writer.write_u16::<NetworkEndian>(self.versions.len() as u16)?;
         for version in &self.versions {
-            bytes.push(0);
-            bytes.push(*version);
+            writer.write_u16::<NetworkEndian>(*version)?;
         }
-        bytes
+        Ok(())
     }
 
-    pub fn read_new<R: Read>(reader: &mut R) -> Result<VersionsCell, &'static str> {
-        let mut two_byte_buf = [0; 2];
-        if let Err(_) = reader.read_exact(&mut two_byte_buf) {
-            return Err("failed to read CircID");
-        }
-        // validate CircID == 0?
-        let mut one_byte_buf = [0; 1];
-        if let Err(_) = reader.read_exact(&mut one_byte_buf) {
-            return Err("failed to read command");
-        }
-        if one_byte_buf[0] != 7 {
-            return Err("expected VERSIONS");
-        }
-        if let Err(_) = reader.read_exact(&mut two_byte_buf) {
-            return Err("failed to read payload length");
-        }
-        if two_byte_buf[0] != 0 || two_byte_buf[1] > 6 {
-            return Err("unsupported number of versions");
-        }
-        if two_byte_buf[1] % 2 != 0 {
-            return Err("odd length VERSIONS payload");
-        }
-        let mut versions: Vec<u8> = Vec::new();
-        for _ in 0..two_byte_buf[1] / 2 {
-            if let Err(_) = reader.read_exact(&mut two_byte_buf) {
-                return Err("couldn't read version");
-            }
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<VersionsCell> {
+        // TODO
+        let circ_id = reader.read_u16::<NetworkEndian>()?;
+        assert!(circ_id == 0);
+        let command = reader.read_u8()?;
+        // TODO
+        assert!(command == 7);
+        let length = reader.read_u16::<NetworkEndian>()?;
+        // TODO
+        assert!(length <= 6);
+        // TODO
+        assert!(length % 2 == 0);
+        let mut versions = Vec::new();
+        for _ in 0..length / 2 {
+            let version = reader.read_u16::<NetworkEndian>()?;
             // check highest byte is 0
-            versions.push(two_byte_buf[1]);
+            versions.push(version);
         }
         Ok(VersionsCell { versions: versions })
     }
@@ -861,19 +759,17 @@ impl VersionsCell {
     /// Both parties MUST select as the link protocol version the highest number contained both in
     /// the VERSIONS cell they sent and in the versions cell they received. If they have no such
     /// version in common, they cannot communicate and MUST close the connection.
-    pub fn negotiate(&self, other: &VersionsCell) -> Result<u8, &'static str> {
-        let mut highest: u8 = 0;
+    pub fn negotiate(&self, other: &VersionsCell) -> Result<u16> {
+        let mut highest: u16 = 0;
         for self_version in &self.versions {
             if *self_version > highest && other.versions.contains(self_version) {
                 highest = *self_version;
             }
         }
         // In reality we only support version 4 right now.
-        if highest == 4 {
-            Ok(highest)
-        } else {
-            Err("no shared versions")
-        }
+        // TODO
+        assert!(highest == 4);
+        Ok(highest)
     }
 }
 
@@ -886,8 +782,8 @@ impl CreateFastCell {
         CreateFastCell { x: x }
     }
 
-    pub fn write_to<W: Write>(&self, writer: &mut W) {
-        writer.write_all(&self.x).unwrap();
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_all(&self.x)
     }
 }
 
@@ -898,14 +794,14 @@ pub struct CreatedFastCell {
 }
 
 impl CreatedFastCell {
-    pub fn read_new<R: Read>(reader: &mut R) -> CreatedFastCell {
+    pub fn read_new<R: Read>(reader: &mut R) -> Result<CreatedFastCell> {
         let mut created_fast_cell = CreatedFastCell {
             y: [0; 20],
             kh: [0; 20],
         };
-        reader.read_exact(&mut created_fast_cell.y).unwrap();
-        reader.read_exact(&mut created_fast_cell.kh).unwrap();
-        created_fast_cell
+        reader.read_exact(&mut created_fast_cell.y)?;
+        reader.read_exact(&mut created_fast_cell.kh)?;
+        Ok(created_fast_cell)
     }
 
     pub fn get_y(&self) -> &[u8; 20] {

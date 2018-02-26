@@ -168,12 +168,13 @@ impl TorClient {
 
     fn negotiate_versions(&mut self) {
         let versions = types::VersionsCell::new(vec![4]);
-        let data = versions.to_bytes();
+        let mut buf: Vec<u8> = Vec::new();
+        versions.write_to(&mut buf).unwrap();
         let mut connection = match self.tls_connection {
             Some(ref mut connection) => connection,
             None => panic!("invalid state - call connect_to first"),
         };
-        match connection.write(&data) {
+        match connection.write(&buf) {
             Ok(len) => println!("sent {}", len),
             Err(e) => panic!(e),
         };
@@ -371,7 +372,8 @@ impl TorClient {
         println!("{:?}", cell);
         match cell.command {
             types::Command::CreatedFast => {
-                let created_fast = types::CreatedFastCell::read_new(&mut &cell.payload[..]);
+                let created_fast =
+                    types::CreatedFastCell::read_new(&mut &cell.payload[..]).unwrap();
                 println!("{:?}", created_fast);
                 let circuit_keys = tor_kdf(&x, created_fast.get_y(), created_fast.get_kh());
             }
@@ -429,12 +431,13 @@ impl TorClient {
                 }
             }
             types::Command::Create2 => {
-                match types::Create2Cell::from_slice(&tor_cell.payload) {
+                match types::Create2Cell::read_new(&mut &tor_cell.payload[..]) {
                     Ok(create2_cell) => {
                         println!("{:?}", create2_cell);
                         // technically we should check create2_cell.h_type here
-                        let client_handshake =
-                            types::NtorClientHandshake::from_slice(create2_cell.h_data).unwrap();
+                        let client_handshake = types::NtorClientHandshake::read_new(
+                            &mut &create2_cell.h_data[..],
+                        ).unwrap();
                         println!("{:?}", client_handshake);
                         if let Some(pending_ntor_context) = self.pending_ntor_context.take() {
                             self.ntor_contexts
@@ -444,10 +447,12 @@ impl TorClient {
                     Err(msg) => println!("{}", msg),
                 }
             }
-            types::Command::Created2 => match types::Created2Cell::from_slice(&tor_cell.payload) {
-                Ok(created2_cell) => self.do_ntor_handshake(tor_cell.circ_id, &created2_cell),
-                Err(msg) => println!("{}", msg),
-            },
+            types::Command::Created2 => {
+                match types::Created2Cell::read_new(&mut &tor_cell.payload[..]) {
+                    Ok(created2_cell) => self.do_ntor_handshake(tor_cell.circ_id, &created2_cell),
+                    Err(msg) => println!("{}", msg),
+                }
+            }
             types::Command::Certs => match types::CertsCell::read_new(&mut &tor_cell.payload[..]) {
                 Ok(certs_cell) => println!("{:?}", certs_cell),
                 Err(msg) => println!("{}", msg),
@@ -468,7 +473,7 @@ impl TorClient {
             println!("{:?}", created2_cell);
             // technically we should check the corresponding create2_cell type here
             let server_handshake =
-                types::NtorServerHandshake::from_slice(created2_cell.h_data).unwrap();
+                types::NtorServerHandshake::read_new(&mut &created2_cell.h_data[..]).unwrap();
             println!("{:?}", server_handshake);
             let Y = montgomery::CompressedMontgomeryU(server_handshake.server_pk);
             let x = scalar::Scalar::from_bits(ntor_context.client_x);
@@ -525,19 +530,9 @@ impl TorClient {
         } else {
             return;
         };
-        match types::RelayCell::from_slice(&bytes) {
+        match types::RelayCell::read_new(&mut &bytes[..]) {
             Ok(relay_cell) => self.handle_relay_cell(circ_id, direction, relay_cell),
-            Err(err) => match err {
-                types::RelayCellError::Unrecognized => {
-                    println!("that cell wasn't for us? (need to decrypt again?)")
-                }
-                types::RelayCellError::InsufficientLength => {
-                    println!("didn't even have PAYLOAD_LEN bytes? (shouldn't happen)")
-                }
-                types::RelayCellError::InsufficientPayloadLength => {
-                    println!("cell not long internally (error?)")
-                }
-            },
+            Err(err) => println!("{}", err),
         };
     }
 

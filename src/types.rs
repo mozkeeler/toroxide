@@ -5,7 +5,6 @@ use std::io::{Error, ErrorKind, Read, Result, Write};
 use certs;
 
 const PAYLOAD_LEN: usize = 509;
-const CELL_LEN: usize = 514; // link protocol v4 is the only one supported at the moment
 
 #[derive(Debug)]
 pub struct Cell {

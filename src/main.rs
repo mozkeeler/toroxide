@@ -240,9 +240,9 @@ impl TorClient {
         let initiator_certs = InitiatorCerts::new();
         let certs_cell = initiator_certs.to_certs_cell();
         let mut buf: Vec<u8> = Vec::new();
-        certs_cell.write_to(&mut buf);
+        certs_cell.write_to(&mut buf).unwrap();
         let cell = types::Cell::new(0, types::Command::Certs, buf);
-        cell.write_to(&mut connection);
+        cell.write_to(&mut connection).unwrap();
 
         // tor-spec.txt section 4.4.2: With Ed25519-SHA256-RFC5705 link authentication, the
         // authentication field of the AUTHENTICATE cell is as follows:
@@ -319,9 +319,9 @@ impl TorClient {
         let authenticate_cell =
             types::AuthenticateCell::new(types::AuthType::Ed25519Sha256Rfc5705, buf);
         let mut buf: Vec<u8> = Vec::new();
-        authenticate_cell.write_to(&mut buf);
+        authenticate_cell.write_to(&mut buf).unwrap();
         let cell = types::Cell::new(0, types::Command::Authenticate, buf);
-        cell.write_to(&mut connection);
+        cell.write_to(&mut connection).unwrap();
     }
 
     fn read_netinfo(&mut self) {
@@ -348,9 +348,9 @@ impl TorClient {
         let localhost = types::OrAddress::IPv4Address([127, 0, 0, 1]);
         let netinfo = types::NetinfoCell::new(timestamp, other_or_address, localhost);
         let mut buf: Vec<u8> = Vec::new();
-        netinfo.write_to(&mut buf);
+        netinfo.write_to(&mut buf).unwrap();
         let cell = types::Cell::new(0, types::Command::Netinfo, buf);
-        cell.write_to(&mut connection);
+        cell.write_to(&mut connection).unwrap();
     }
 
     fn create_fast(&mut self) {
@@ -359,7 +359,7 @@ impl TorClient {
         csprng.fill_bytes(&mut x);
         let create_fast_cell = types::CreateFastCell::new(x);
         let mut buf: Vec<u8> = Vec::new();
-        create_fast_cell.write_to(&mut buf);
+        create_fast_cell.write_to(&mut buf).unwrap();
         let circ_id = self.get_new_circ_id();
         let cell = types::Cell::new(circ_id, types::Command::CreateFast, buf);
 
@@ -367,7 +367,7 @@ impl TorClient {
             Some(ref mut connection) => connection,
             None => panic!("invalid state - call connect_to first"),
         };
-        cell.write_to(&mut connection);
+        cell.write_to(&mut connection).unwrap();
         let cell = types::Cell::read_new(&mut connection).unwrap();
         println!("{:?}", cell);
         match cell.command {

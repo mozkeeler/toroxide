@@ -724,9 +724,9 @@ impl VersionsCell {
         writer.write_u16::<NetworkEndian>(0)?;
         // 7 is VERSIONS
         writer.write_u8(7)?;
-        // Payload is 2 bytes.
-        assert!(self.versions.len() < 65536);
-        writer.write_u16::<NetworkEndian>(self.versions.len() as u16)?;
+        // Payload length is 2 bytes.
+        assert!(self.versions.len() < 65536 / 2);
+        writer.write_u16::<NetworkEndian>(2 * self.versions.len() as u16)?;
         for version in &self.versions {
             writer.write_u16::<NetworkEndian>(*version)?;
         }

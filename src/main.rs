@@ -20,6 +20,7 @@ mod tls;
 mod types;
 mod util;
 
+use byteorder::{NetworkEndian, ReadBytesExt};
 use constant_time_eq::constant_time_eq;
 use crypto::{aes, symmetriccipher};
 use curve25519_dalek::montgomery;
@@ -44,7 +45,7 @@ struct TorClient {
     /// Created NtorContext that we don't know what circuit id it's for yet
     pending_ntor_context: Option<NtorContext>,
     /// Map of circuit id to CircuitKeys
-    ntor_keys: HashMap<u32, CircuitKeys>,
+    circuit_keys: HashMap<u32, CircuitKeys>,
     /// Maybe the certs parsed and validated from a peer's CERTS cell
     responder_certs: Option<ResponderCerts>,
     /// A set indicating the circuit IDs that have been used.
@@ -120,16 +121,18 @@ fn main() {
         return;
     }
 
-    let peer = &dir::get_tor_peers()[0];
-    println!("{:?}", peer);
+    let peers = dir::get_tor_peers();
+    println!("{:?}", peers);
     let mut tor_client = TorClient::new();
-    tor_client.connect_to(&peer);
+    tor_client.connect_to(&peers[0]);
     tor_client.negotiate_versions();
     tor_client.read_certs();
     tor_client.read_auth_challenge();
     tor_client.send_certs_and_authenticate_cells();
     tor_client.read_netinfo();
-    tor_client.create_fast();
+    // TODO: get the created circuit id, reference it in extend
+    let circ_id = tor_client.create_fast();
+    tor_client.extend(&peers[1], circ_id);
 }
 
 fn debug_dump_from_stdin() {
@@ -156,7 +159,7 @@ impl TorClient {
             tls_connection: None,
             ntor_contexts: HashMap::new(),
             pending_ntor_context: None,
-            ntor_keys: HashMap::new(),
+            circuit_keys: HashMap::new(),
             responder_certs: None,
             used_circ_ids: HashSet::new(),
         }
@@ -353,7 +356,7 @@ impl TorClient {
         cell.write_to(&mut connection).unwrap();
     }
 
-    fn create_fast(&mut self) {
+    fn create_fast(&mut self) -> u32 {
         let mut x = [0; 20];
         let mut csprng: OsRng = OsRng::new().unwrap();
         csprng.fill_bytes(&mut x);
@@ -370,16 +373,65 @@ impl TorClient {
         cell.write_to(&mut connection).unwrap();
         let cell = types::Cell::read_new(&mut connection).unwrap();
         println!("{:?}", cell);
-        match cell.command {
+        let circuit_keys = match cell.command {
             types::Command::CreatedFast => {
                 let created_fast =
                     types::CreatedFastCell::read_new(&mut &cell.payload[..]).unwrap();
                 println!("{:?}", created_fast);
-                let circuit_keys = tor_kdf(&x, created_fast.get_y(), created_fast.get_kh());
+                tor_kdf(&x, created_fast.get_y(), created_fast.get_kh())
             }
-            types::Command::Destroy => println!("got DESTROY cell"),
+            types::Command::Destroy => panic!("got DESTROY cell"),
             _ => panic!("Expected CREATED_FAST or DESTROY, got {:?}", cell.command),
         };
+        self.circuit_keys.insert(circ_id, circuit_keys);
+        circ_id
+    }
+
+    fn extend(&mut self, node: &dir::TorPeer, circ_id: u32) {
+        let client_key = keys::Ed25519Key::new();
+        let ntor_client_handshake = types::NtorClientHandshake::new(node, &client_key);
+        let mut ntor_client_handshake_bytes = Vec::new();
+        ntor_client_handshake
+            .write_to(&mut ntor_client_handshake_bytes)
+            .unwrap();
+        let extend2 = types::Extend2Cell::new(
+            node,
+            types::ClientHandshakeType::Ntor,
+            ntor_client_handshake_bytes,
+        );
+        let mut extend2_bytes = Vec::new();
+        extend2.write_to(&mut extend2_bytes).unwrap();
+        let bytes = if let Some(ref mut circuit_keys) = self.circuit_keys.get_mut(&circ_id) {
+            let mut hash = Sha1::new(); // TODO: this needs to go in CircuitKeys?
+            hash.update(&circuit_keys.forward_digest);
+            let hashed = hash.digest().bytes();
+            let digest = (&mut &hashed[..]).read_u32::<NetworkEndian>().unwrap();
+            let relay_cell = types::RelayCell::new(
+                types::RelayCommand::Extend2,
+                1, // TODO - generate stream IDs
+                digest,
+                extend2_bytes,
+            );
+            let mut buf = Vec::new();
+            relay_cell.write_to(&mut buf).unwrap();
+            let mut encrypted_bytes = Vec::with_capacity(buf.len());
+            encrypted_bytes.resize(buf.len(), 0);
+            circuit_keys
+                .forward_key
+                .aes
+                .process(&buf, &mut encrypted_bytes);
+            encrypted_bytes
+        } else {
+            panic!("extend given bogus circ_id?)");
+        };
+        {
+            let mut connection = match self.tls_connection {
+                Some(ref mut connection) => connection,
+                None => panic!("invalid state - call connect_to first"),
+            };
+            let cell = types::Cell::new(circ_id, types::Command::Relay, bytes);
+            cell.write_to(&mut connection).unwrap();
+        }
     }
 
     fn read_cell(&mut self) {
@@ -436,7 +488,7 @@ impl TorClient {
                         println!("{:?}", create2_cell);
                         // technically we should check create2_cell.h_type here
                         let client_handshake = types::NtorClientHandshake::read_new(
-                            &mut &create2_cell.h_data[..],
+                            &mut create2_cell.get_h_data(),
                         ).unwrap();
                         println!("{:?}", client_handshake);
                         if let Some(pending_ntor_context) = self.pending_ntor_context.take() {
@@ -501,8 +553,8 @@ impl TorClient {
             if constant_time_eq(&calculated_auth, &server_handshake.auth) {
                 // so this is actually the prk in the kdf... (confusing documentation)
                 let key_seed = ntor_hmac(&secret_input, b"ntor-curve25519-sha256-1:key_extract");
-                let ntor_keys = compute_ntor_keys(&key_seed);
-                self.ntor_keys.insert(circ_id, ntor_keys);
+                let circuit_keys = compute_ntor_keys(&key_seed);
+                self.circuit_keys.insert(circ_id, circuit_keys);
             }
         }
     }
@@ -513,15 +565,15 @@ impl TorClient {
         direction: Direction,
         encrypted_relay_cell: &[u8],
     ) {
-        let bytes = if let Some(ref mut ntor_keys) = self.ntor_keys.get_mut(&circ_id) {
+        let bytes = if let Some(ref mut circuit_keys) = self.circuit_keys.get_mut(&circ_id) {
             let mut decrypted_relay_cell: Vec<u8> = Vec::with_capacity(encrypted_relay_cell.len());
             decrypted_relay_cell.resize(encrypted_relay_cell.len(), 0);
             // So we have to have some way to roll back things that weren't actually for us (or
             // attacks that would attempt to modify our counter...)
             // It seems the canonical implementation just kills the connection if this ever happens.
             let aes_context = match direction {
-                Direction::Incoming => &mut ntor_keys.backward_key,
-                Direction::Outgoing => &mut ntor_keys.forward_key,
+                Direction::Incoming => &mut circuit_keys.backward_key,
+                Direction::Outgoing => &mut circuit_keys.forward_key,
             };
             aes_context
                 .aes

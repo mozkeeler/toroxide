@@ -1,4 +1,5 @@
 use curl::easy::Easy;
+use sha1::Sha1;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::option;
@@ -37,7 +38,7 @@ pub fn get_tor_peers() -> Vec<TorPeer> {
 pub struct TorPeer {
     ip_address: Ipv4Addr,
     port: u16,
-    pub rsa_public_key: Vec<u8>,
+    rsa_public_key: Vec<u8>,
     ntor_onion_key: [u8; 32],
 }
 
@@ -87,6 +88,19 @@ impl TorPeer {
             rsa_public_key: rsa_public_key,
             ntor_onion_key: ntor_onion_key,
         }
+    }
+
+    /// Get the sha-1 hash of the node's RSA identity key, presumably. For use in the Ntor
+    /// handshake.
+    pub fn get_node_id_hash(&self) -> [u8; 20] {
+        let mut hash = Sha1::new();
+        hash.update(&self.rsa_public_key);
+        hash.digest().bytes()
+    }
+
+    /// Get the node's public Ntor key. For use in the Ntor handshake.
+    pub fn get_key_id(&self) -> &[u8; 32] {
+        &self.ntor_onion_key
     }
 }
 

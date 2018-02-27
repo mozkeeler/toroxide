@@ -3,6 +3,8 @@ use std::fmt;
 use std::io::{Error, ErrorKind, Read, Result, Write};
 
 use certs;
+use dir;
+use keys;
 
 const PAYLOAD_LEN: usize = 509;
 
@@ -554,6 +556,27 @@ impl RelayCommand {
             _ => RelayCommand::Unknown(relay_command),
         }
     }
+
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            &RelayCommand::Begin => 1,
+            &RelayCommand::Data => 2,
+            &RelayCommand::End => 3,
+            &RelayCommand::Connected => 4,
+            &RelayCommand::SendMe => 5,
+            &RelayCommand::Extend => 6,
+            &RelayCommand::Extended => 7,
+            &RelayCommand::Truncate => 8,
+            &RelayCommand::Truncated => 9,
+            &RelayCommand::Drop => 10,
+            &RelayCommand::Resolve => 11,
+            &RelayCommand::Resolved => 12,
+            &RelayCommand::BeginDir => 13,
+            &RelayCommand::Extend2 => 14,
+            &RelayCommand::Extended2 => 15,
+            &RelayCommand::Unknown(value) => value,
+        }
+    }
 }
 
 impl RelayCell {
@@ -584,6 +607,34 @@ impl RelayCell {
             length: length,
             data: data,
         })
+    }
+
+    pub fn new(
+        relay_command: RelayCommand,
+        stream_id: u16,
+        digest: u32,
+        data: Vec<u8>,
+    ) -> RelayCell {
+        assert!(data.len() < 65536);
+        RelayCell {
+            relay_command: relay_command,
+            recognized: 0,
+            stream_id: stream_id,
+            digest: digest,
+            length: data.len() as u16,
+            data: data,
+        }
+    }
+
+    // So this is a bit annoying... we have to calculate the digest with the entire cell payload
+    // size worth of data (with the digest field set to 0).
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_u8(self.relay_command.as_u8())?;
+        writer.write_u16::<NetworkEndian>(self.recognized)?;
+        writer.write_u16::<NetworkEndian>(self.stream_id)?;
+        writer.write_u32::<NetworkEndian>(self.digest)?;
+        writer.write_u16::<NetworkEndian>(self.length)?;
+        writer.write_all(&self.data)
     }
 }
 
@@ -618,13 +669,22 @@ impl ClientHandshakeType {
             _ => ClientHandshakeType::Unknown(h_type),
         }
     }
+
+    pub fn as_u16(&self) -> u16 {
+        match self {
+            &ClientHandshakeType::Tap => 0,
+            &ClientHandshakeType::Reserved => 1,
+            &ClientHandshakeType::Ntor => 2,
+            &ClientHandshakeType::Unknown(value) => value,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Create2Cell {
     h_type: ClientHandshakeType,
     h_len: u16,
-    pub h_data: Vec<u8>,
+    h_data: Vec<u8>,
 }
 
 impl Create2Cell {
@@ -639,6 +699,26 @@ impl Create2Cell {
             h_len: h_len,
             h_data: h_data,
         })
+    }
+
+    pub fn new(h_type: ClientHandshakeType, h_data: Vec<u8>) -> Create2Cell {
+        assert!(h_data.len() < 65536);
+        Create2Cell {
+            h_type: h_type,
+            h_len: h_data.len() as u16,
+            h_data: h_data,
+        }
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_u16::<NetworkEndian>(self.h_type.as_u16())?;
+        assert!(self.h_data.len() < 65536);
+        writer.write_u16::<NetworkEndian>(self.h_data.len() as u16)?;
+        writer.write_all(&self.h_data)
+    }
+
+    pub fn get_h_data(&self) -> &[u8] {
+        &self.h_data
     }
 }
 
@@ -660,6 +740,20 @@ impl NtorClientHandshake {
         reader.read_exact(&mut handshake.key_id)?;
         reader.read_exact(&mut handshake.client_pk)?;
         Ok(handshake)
+    }
+
+    pub fn new(peer: &dir::TorPeer, client_key: &keys::Ed25519Key) -> NtorClientHandshake {
+        NtorClientHandshake {
+            node_id: peer.get_node_id_hash(),
+            key_id: peer.get_key_id().clone(),
+            client_pk: client_key.get_public_key_bytes(),
+        }
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_all(&self.node_id)?;
+        writer.write_all(&self.key_id)?;
+        writer.write_all(&self.client_pk)
     }
 }
 
@@ -809,5 +903,35 @@ impl CreatedFastCell {
 
     pub fn get_kh(&self) -> &[u8; 20] {
         &self.kh
+    }
+}
+
+#[derive(Debug)]
+pub struct Extend2Cell {
+    /// The Ed25519 identity key of the node being extended to.
+    ed25519_identity: [u8; 32],
+    /// In reality, always ClientHandshakeType::Ntor
+    h_type: ClientHandshakeType,
+    h_data: Vec<u8>,
+}
+
+impl Extend2Cell {
+    pub fn new(node: &dir::TorPeer, h_type: ClientHandshakeType, h_data: Vec<u8>) -> Extend2Cell {
+        Extend2Cell {
+            ed25519_identity: node.get_key_id().clone(),
+            h_type: h_type,
+            h_data: h_data,
+        }
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_u8(1)?; // only one link specifier
+        writer.write_u8(3)?; // Ed25519 identity (key? docs say fingerprint but that's wrong)
+        writer.write_u8(32)?; // Ed25519 public key is 32 bytes
+        writer.write_all(&self.ed25519_identity)?;
+        writer.write_u16::<NetworkEndian>(self.h_type.as_u16())?;
+        assert!(self.h_data.len() < 65536);
+        writer.write_u16::<NetworkEndian>(self.h_data.len() as u16)?;
+        writer.write_all(&self.h_data)
     }
 }

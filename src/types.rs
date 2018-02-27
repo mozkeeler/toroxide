@@ -1,4 +1,5 @@
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
+use sha1::Sha1;
 use std::fmt;
 use std::io::{Error, ErrorKind, Read, Result, Write};
 
@@ -591,13 +592,10 @@ impl RelayCell {
         // This isn't making much sense to me. For DATA cells, the length field doesn't seem to
         // correspond to... anything?
         let length = reader.read_u16::<NetworkEndian>()?;
-        let data_length = if (length as usize) < PAYLOAD_LEN - 11 {
-            length as usize
-        } else {
-            PAYLOAD_LEN - 11
-        };
-        let mut data: Vec<u8> = Vec::with_capacity(data_length);
-        data.resize(data_length, 0);
+        // So, we have an indication of the length of the data in the relay cell, but there's
+        // actually always supposed to be PAYLOAD_LEN - 11 bytes (the rest padded 0 I suppose).
+        let mut data: Vec<u8> = Vec::with_capacity(PAYLOAD_LEN - 11);
+        data.resize(PAYLOAD_LEN - 11, 0);
         reader.read_exact(&mut data)?;
         Ok(RelayCell {
             relay_command: relay_command,
@@ -609,32 +607,49 @@ impl RelayCell {
         })
     }
 
-    pub fn new(
-        relay_command: RelayCommand,
-        stream_id: u16,
-        digest: u32,
-        data: Vec<u8>,
-    ) -> RelayCell {
-        assert!(data.len() < 65536);
+    /// Creates a new `RelayCell` with the digest set to 0. Call `set_digest` with the appropriate
+    /// running digest to set its value (which is calculated in part based on the rest of the bytes
+    /// of the `RelayCell`, with the digest set to 0).
+    pub fn new(relay_command: RelayCommand, stream_id: u16, data: Vec<u8>) -> RelayCell {
+        assert!(data.len() <= PAYLOAD_LEN - 11);
         RelayCell {
             relay_command: relay_command,
             recognized: 0,
             stream_id: stream_id,
-            digest: digest,
+            digest: 0,
             length: data.len() as u16,
             data: data,
         }
     }
 
-    // So this is a bit annoying... we have to calculate the digest with the entire cell payload
-    // size worth of data (with the digest field set to 0).
+    pub fn set_digest(&mut self, digest: &mut Sha1) {
+        // This should only be called if the digest hasn't been set or read from the wire.
+        assert!(self.digest == 0);
+        // It would be neat if Sha1 implemented Write, so we could just self.write_to(digest), but
+        // we can fake it here.
+        let mut buf = Vec::new();
+        self.write_to(&mut buf).unwrap();
+        digest.update(&buf);
+        let result = digest.digest().bytes();
+        self.digest = (&mut &result[..]).read_u32::<NetworkEndian>().unwrap();
+    }
+
     pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
         writer.write_u8(self.relay_command.as_u8())?;
         writer.write_u16::<NetworkEndian>(self.recognized)?;
         writer.write_u16::<NetworkEndian>(self.stream_id)?;
         writer.write_u32::<NetworkEndian>(self.digest)?;
         writer.write_u16::<NetworkEndian>(self.length)?;
-        writer.write_all(&self.data)
+        // This always gets padded with 0 bytes to PAYLOAD_LEN - 11 bytes
+        writer.write_all(&self.data)?;
+        // TODO: this should be a const
+        if self.data.len() < PAYLOAD_LEN - 11 {
+            let padding_size = PAYLOAD_LEN - 11 - self.data.len();
+            let mut zeroes = Vec::with_capacity(padding_size);
+            zeroes.resize(padding_size, 0);
+            writer.write_all(&zeroes)?;
+        }
+        Ok(())
     }
 }
 
@@ -744,8 +759,8 @@ impl NtorClientHandshake {
 
     pub fn new(peer: &dir::TorPeer, client_key: &keys::Ed25519Key) -> NtorClientHandshake {
         NtorClientHandshake {
-            node_id: peer.get_node_id_hash(),
-            key_id: peer.get_key_id().clone(),
+            node_id: peer.get_node_id(),
+            key_id: peer.get_ed25519_id_key(),
             client_pk: client_key.get_public_key_bytes(),
         }
     }
@@ -910,6 +925,13 @@ impl CreatedFastCell {
 pub struct Extend2Cell {
     /// The Ed25519 identity key of the node being extended to.
     ed25519_identity: [u8; 32],
+    /// SHA-1 hash of RSA identity key. Mandatory for some reason (but not specified?)
+    rsa_id: [u8; 20],
+    /// IPv4 address of node being extended to (again mandatory but not specified?)
+    /// (do we have to worry about endianness here?)
+    ipv4: [u8; 4],
+    /// (port for the above)
+    port: u16,
     /// In reality, always ClientHandshakeType::Ntor
     h_type: ClientHandshakeType,
     h_data: Vec<u8>,
@@ -918,17 +940,32 @@ pub struct Extend2Cell {
 impl Extend2Cell {
     pub fn new(node: &dir::TorPeer, h_type: ClientHandshakeType, h_data: Vec<u8>) -> Extend2Cell {
         Extend2Cell {
-            ed25519_identity: node.get_key_id().clone(),
+            ed25519_identity: node.get_ed25519_id_key(),
+            rsa_id: node.get_node_id(),
+            ipv4: node.get_ipv4_as_bytes(),
+            port: node.get_port(),
             h_type: h_type,
             h_data: h_data,
         }
     }
 
     pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
-        writer.write_u8(1)?; // only one link specifier
-        writer.write_u8(3)?; // Ed25519 identity (key? docs say fingerprint but that's wrong)
+        // 3 link specifiers
+        writer.write_u8(3)?;
+        // IPv4 address
+        writer.write_u8(0)?;
+        writer.write_u8(6)?; // 4 bytes for IPv4 plus 2 bytes for port
+        writer.write_all(&self.ipv4)?;
+        writer.write_u16::<NetworkEndian>(self.port)?;
+        // RSA ID hash
+        writer.write_u8(2)?;
+        writer.write_u8(20)?;
+        writer.write_all(&self.rsa_id)?;
+        // Ed25519 public key (docs say fingerprint but that's wrong)
+        writer.write_u8(3)?;
         writer.write_u8(32)?; // Ed25519 public key is 32 bytes
         writer.write_all(&self.ed25519_identity)?;
+
         writer.write_u16::<NetworkEndian>(self.h_type.as_u16())?;
         assert!(self.h_data.len() < 65536);
         writer.write_u16::<NetworkEndian>(self.h_data.len() as u16)?;

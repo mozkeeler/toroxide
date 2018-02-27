@@ -1,5 +1,4 @@
 use curl::easy::Easy;
-use sha1::Sha1;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::option;
@@ -38,8 +37,14 @@ pub fn get_tor_peers() -> Vec<TorPeer> {
 pub struct TorPeer {
     ip_address: Ipv4Addr,
     port: u16,
+    /// I don't know what this is for.
     rsa_public_key: Vec<u8>,
+    /// Ntor handshake key, right?
     ntor_onion_key: [u8; 32],
+    /// sha-1 hash of the peer's RSA ID key (not the above rsa_public_key)
+    node_id: [u8; 20],
+    /// Ed25519 identity public key
+    ed25519_id_key: [u8; 32],
 }
 
 impl TorPeer {
@@ -63,14 +68,15 @@ impl TorPeer {
         );
         let keys_data = do_get(&keys_uri);
         let mut ntor_onion_key: [u8; 32] = [0; 32];
+        let mut ed25519_id_key: [u8; 32] = [0; 32];
         let mut in_rsa_key = false;
-        let mut rsa_public_key: Vec<u8> = Vec::new();
+        let mut rsa_public_key_base64 = String::new();
         for line in keys_data.lines() {
             if line == "-----END RSA PUBLIC KEY-----" {
                 in_rsa_key = false;
             }
             if in_rsa_key {
-                rsa_public_key.extend(base64::decode(line).unwrap());
+                rsa_public_key_base64.push_str(line);
             }
             if line == "-----BEGIN RSA PUBLIC KEY-----" {
                 in_rsa_key = true;
@@ -80,27 +86,41 @@ impl TorPeer {
                     line.split(" ").nth(1).unwrap(),
                 ).unwrap());
             }
+            if line.starts_with("id ed25519") {
+                ed25519_id_key = util::slice_to_32_byte_array(&base64::decode(
+                    line.split(" ").nth(2).unwrap(),
+                ).unwrap());
+            }
         }
         let router_parts: Vec<&str> = router_line.split(" ").collect();
+        let node_id: [u8; 20] =
+            util::slice_to_20_byte_array(&base64::decode(router_parts[2]).unwrap());
         TorPeer {
             ip_address: router_parts[5].parse().unwrap(),
             port: u16::from_str(router_parts[6]).unwrap(),
-            rsa_public_key: rsa_public_key,
+            rsa_public_key: base64::decode(&rsa_public_key_base64).unwrap(),
             ntor_onion_key: ntor_onion_key,
+            node_id: node_id,
+            ed25519_id_key: ed25519_id_key,
         }
     }
 
-    /// Get the sha-1 hash of the node's RSA identity key, presumably. For use in the Ntor
-    /// handshake.
-    pub fn get_node_id_hash(&self) -> [u8; 20] {
-        let mut hash = Sha1::new();
-        hash.update(&self.rsa_public_key);
-        hash.digest().bytes()
+    /// Get the sha-1 hash of the node's RSA identity key. For use in the Ntor handshake.
+    pub fn get_node_id(&self) -> [u8; 20] {
+        self.node_id
     }
 
     /// Get the node's public Ntor key. For use in the Ntor handshake.
-    pub fn get_key_id(&self) -> &[u8; 32] {
-        &self.ntor_onion_key
+    pub fn get_ed25519_id_key(&self) -> [u8; 32] {
+        self.ed25519_id_key
+    }
+
+    pub fn get_ipv4_as_bytes(&self) -> [u8; 4] {
+        self.ip_address.octets()
+    }
+
+    pub fn get_port(&self) -> u16 {
+        self.port
     }
 }
 

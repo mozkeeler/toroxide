@@ -20,7 +20,6 @@ mod tls;
 mod types;
 mod util;
 
-use byteorder::{NetworkEndian, ReadBytesExt};
 use constant_time_eq::constant_time_eq;
 use crypto::{aes, symmetriccipher};
 use curve25519_dalek::montgomery;
@@ -79,8 +78,8 @@ impl AesContext {
 }
 
 struct CircuitKeys {
-    forward_digest: [u8; 20],
-    backward_digest: [u8; 20],
+    forward_digest: Sha1,
+    backward_digest: Sha1,
     forward_key: AesContext,
     backward_key: AesContext,
     // KH in hidden service protocol? (doesn't appear to be implemented...?)
@@ -89,8 +88,8 @@ struct CircuitKeys {
 impl CircuitKeys {
     fn new(k: &[u8]) -> CircuitKeys {
         CircuitKeys {
-            forward_digest: slice_to_20_byte_array(&k[0..20]),
-            backward_digest: slice_to_20_byte_array(&k[20..40]),
+            forward_digest: Sha1::from(&k[0..20]),
+            backward_digest: Sha1::from(&k[20..40]),
             forward_key: AesContext::new(&k[40..56]),
             backward_key: AesContext::new(&k[56..72]),
         }
@@ -130,7 +129,6 @@ fn main() {
     tor_client.read_auth_challenge();
     tor_client.send_certs_and_authenticate_cells();
     tor_client.read_netinfo();
-    // TODO: get the created circuit id, reference it in extend
     let circ_id = tor_client.create_fast();
     tor_client.extend(&peers[1], circ_id);
 }
@@ -387,6 +385,64 @@ impl TorClient {
         circ_id
     }
 
+    fn encrypt_cell_bytes(
+        &mut self,
+        circ_id: u32,
+        relay_command: types::RelayCommand,
+        bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        if let Some(ref mut circuit_keys) = self.circuit_keys.get_mut(&circ_id) {
+            let mut relay_cell = types::RelayCell::new(relay_command, 0, bytes);
+            relay_cell.set_digest(&mut circuit_keys.forward_digest);
+            let mut buf = Vec::new();
+            relay_cell.write_to(&mut buf).unwrap();
+            let mut encrypted_bytes = Vec::with_capacity(buf.len());
+            encrypted_bytes.resize(buf.len(), 0);
+            circuit_keys
+                .forward_key
+                .aes
+                .process(&buf, &mut encrypted_bytes);
+            encrypted_bytes
+        } else {
+            panic!("encrypt_cell_bytes given bogus circ_id?)");
+        }
+    }
+
+    fn decrypt_cell_bytes(&mut self, circ_id: u32, bytes: &[u8]) -> types::RelayCell {
+        if let Some(ref mut circuit_keys) = self.circuit_keys.get_mut(&circ_id) {
+            let mut decrypted_cell_bytes: Vec<u8> = Vec::with_capacity(bytes.len());
+            decrypted_cell_bytes.resize(bytes.len(), 0);
+            // So we have to have some way to roll back things that weren't actually for us (or
+            // attacks that would attempt to modify our counter...)
+            // It seems the canonical implementation just kills the connection if this ever happens.
+            circuit_keys
+                .backward_key
+                .aes
+                .process(bytes, &mut decrypted_cell_bytes);
+            // TODO: handle digest, things not for us, etc.
+            types::RelayCell::read_new(&mut &decrypted_cell_bytes[..]).unwrap()
+        } else {
+            panic!("decrypt_cell_bytes given bogus circ_id?)");
+        }
+    }
+
+    fn send_cell_bytes(&mut self, circ_id: u32, command: types::Command, bytes: Vec<u8>) {
+        let mut connection = match self.tls_connection {
+            Some(ref mut connection) => connection,
+            None => panic!("invalid state - call connect_to first"),
+        };
+        let cell = types::Cell::new(circ_id, command, bytes);
+        cell.write_to(&mut connection).unwrap();
+    }
+
+    fn read_cell(&mut self) -> types::Cell {
+        let mut connection = match self.tls_connection {
+            Some(ref mut connection) => connection,
+            None => panic!("invalid state - call connect_to first"),
+        };
+        types::Cell::read_new(&mut connection).unwrap()
+    }
+
     fn extend(&mut self, node: &dir::TorPeer, circ_id: u32) {
         let client_key = keys::Ed25519Key::new();
         let ntor_client_handshake = types::NtorClientHandshake::new(node, &client_key);
@@ -401,46 +457,16 @@ impl TorClient {
         );
         let mut extend2_bytes = Vec::new();
         extend2.write_to(&mut extend2_bytes).unwrap();
-        let bytes = if let Some(ref mut circuit_keys) = self.circuit_keys.get_mut(&circ_id) {
-            let mut hash = Sha1::new(); // TODO: this needs to go in CircuitKeys?
-            hash.update(&circuit_keys.forward_digest);
-            let hashed = hash.digest().bytes();
-            let digest = (&mut &hashed[..]).read_u32::<NetworkEndian>().unwrap();
-            let relay_cell = types::RelayCell::new(
-                types::RelayCommand::Extend2,
-                1, // TODO - generate stream IDs
-                digest,
-                extend2_bytes,
-            );
-            let mut buf = Vec::new();
-            relay_cell.write_to(&mut buf).unwrap();
-            let mut encrypted_bytes = Vec::with_capacity(buf.len());
-            encrypted_bytes.resize(buf.len(), 0);
-            circuit_keys
-                .forward_key
-                .aes
-                .process(&buf, &mut encrypted_bytes);
-            encrypted_bytes
-        } else {
-            panic!("extend given bogus circ_id?)");
-        };
-        {
-            let mut connection = match self.tls_connection {
-                Some(ref mut connection) => connection,
-                None => panic!("invalid state - call connect_to first"),
-            };
-            let cell = types::Cell::new(circ_id, types::Command::Relay, bytes);
-            cell.write_to(&mut connection).unwrap();
-        }
-    }
-
-    fn read_cell(&mut self) {
-        let mut connection = match self.tls_connection {
-            Some(ref mut connection) => connection,
-            None => panic!("invalid state - call connect_to first"),
-        };
-        let cell = types::Cell::read_new(&mut connection).unwrap();
+        let bytes = self.encrypt_cell_bytes(circ_id, types::RelayCommand::Extend2, extend2_bytes);
+        // EXTEND cells must always be sent in RELAY_EARLY cells(?)
+        self.send_cell_bytes(circ_id, types::Command::RelayEarly, bytes);
+        let cell = self.read_cell();
         println!("{:?}", cell);
+        let extended2 = match cell.command {
+            types::Command::Relay => self.decrypt_cell_bytes(circ_id, &cell.payload),
+            _ => panic!("expected RELAY, got {:?}", cell.command),
+        };
+        println!("{}", extended2);
     }
 
     fn handle_event(&mut self, event: &String) {
@@ -455,7 +481,7 @@ impl TorClient {
 
     fn decode_keygen(&mut self, keys_hex: &[&str]) {
         self.pending_ntor_context = Some(NtorContext {
-            router_id: slice_to_20_byte_array(&hex::decode(keys_hex[0]).unwrap()),
+            router_id: util::slice_to_20_byte_array(&hex::decode(keys_hex[0]).unwrap()),
             client_B: util::slice_to_32_byte_array(&hex::decode(keys_hex[1]).unwrap()),
             client_X: util::slice_to_32_byte_array(&hex::decode(keys_hex[2]).unwrap()),
             client_x: util::slice_to_32_byte_array(&hex::decode(keys_hex[3]).unwrap()),
@@ -613,15 +639,8 @@ impl TorClient {
     }
 }
 
-// Ok there has to be a way to do this more generically.
 fn slice_to_16_byte_array(bytes: &[u8]) -> [u8; 16] {
     let mut fixed_size: [u8; 16] = [0; 16];
-    fixed_size.copy_from_slice(&bytes);
-    fixed_size
-}
-
-fn slice_to_20_byte_array(bytes: &[u8]) -> [u8; 20] {
-    let mut fixed_size: [u8; 20] = [0; 20];
     fixed_size.copy_from_slice(&bytes);
     fixed_size
 }
@@ -757,6 +776,7 @@ impl ResponderCerts {
             return Err("RSA identity cert is not self-signed");
         }
         // rsa identity key (in rsa_identity_cert) signed ed25519_identity_cert, is 1024 bits
+        // TODO: verify that this matches the node id?
         let identity_key = self.rsa_identity_cert.get_key();
         if !identity_key.check_ed25519_identity_signature(&self.ed25519_identity_cert) {
             return Err("RSA identity cert did not sign Ed25519 identity cert");
@@ -879,30 +899,12 @@ fn tor_kdf(x: &[u8; 20], y: &[u8; 20], kh: &[u8; 20]) -> CircuitKeys {
         util::hexdump(&kh_calculated);
     }
 
-    let mut hash = Sha1::new();
-    hash.update(&k0);
-    hash.update(&[1]);
-    let forward_digest = hash.digest().bytes();
-
-    let mut hash = Sha1::new();
-    hash.update(&k0);
-    hash.update(&[2]);
-    let backward_digest = hash.digest().bytes();
-
     let mut buffer: Vec<u8> = Vec::new();
-    let mut hash = Sha1::new();
-    hash.update(&k0);
-    hash.update(&[3]);
-    buffer.extend(hash.digest().bytes().iter());
-    let mut hash = Sha1::new();
-    hash.update(&k0);
-    hash.update(&[4]);
-    buffer.extend(hash.digest().bytes().iter());
-
-    CircuitKeys {
-        forward_digest: forward_digest,
-        backward_digest: backward_digest,
-        forward_key: AesContext::new(&buffer[0..16]),
-        backward_key: AesContext::new(&buffer[16..32]),
+    for i in 1..5 {
+        let mut hash = Sha1::new();
+        hash.update(&k0);
+        hash.update(&[i]);
+        buffer.extend(hash.digest().bytes().iter());
     }
+    CircuitKeys::new(&buffer)
 }

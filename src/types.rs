@@ -508,12 +508,12 @@ impl NetinfoCell {
 }
 
 pub struct RelayCell {
-    relay_command: RelayCommand,
+    pub relay_command: RelayCommand,
     recognized: u16,
     stream_id: u16,
     digest: u32,
     length: u16,
-    data: Vec<u8>,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -757,10 +757,10 @@ impl NtorClientHandshake {
         Ok(handshake)
     }
 
-    pub fn new(peer: &dir::TorPeer, client_key: &keys::Ed25519Key) -> NtorClientHandshake {
+    pub fn new(peer: &dir::TorPeer, client_key: &keys::Curve25519Keypair) -> NtorClientHandshake {
         NtorClientHandshake {
             node_id: peer.get_node_id(),
-            key_id: peer.get_ed25519_id_key(),
+            key_id: peer.get_ntor_key(),
             client_pk: client_key.get_public_key_bytes(),
         }
     }

@@ -111,6 +111,11 @@ impl TorPeer {
     }
 
     /// Get the node's public Ntor key. For use in the Ntor handshake.
+    pub fn get_ntor_key(&self) -> [u8; 32] {
+        self.ntor_onion_key
+    }
+
+    /// Get the node's public Ed25519 identity key. For use in the link handshake.
     pub fn get_ed25519_id_key(&self) -> [u8; 32] {
         self.ed25519_id_key
     }

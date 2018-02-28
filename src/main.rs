@@ -55,7 +55,7 @@ struct TorClient {
 struct NtorContext {
     /// The SHA-1 hash of the router's RSA key
     router_id: [u8; 20],
-    /// The client's ntor onion key "B" (public)
+    /// The router's ntor onion key "B" (public)
     client_B: [u8; 32],
     /// The ntor handshake public key "X"
     client_X: [u8; 32],
@@ -444,8 +444,9 @@ impl TorClient {
     }
 
     fn extend(&mut self, node: &dir::TorPeer, circ_id: u32) {
-        let client_key = keys::Ed25519Key::new();
-        let ntor_client_handshake = types::NtorClientHandshake::new(node, &client_key);
+        println!("{:?}", node);
+        let client_keypair = keys::Curve25519Keypair::new();
+        let ntor_client_handshake = types::NtorClientHandshake::new(node, &client_keypair);
         let mut ntor_client_handshake_bytes = Vec::new();
         ntor_client_handshake
             .write_to(&mut ntor_client_handshake_bytes)
@@ -462,11 +463,24 @@ impl TorClient {
         self.send_cell_bytes(circ_id, types::Command::RelayEarly, bytes);
         let cell = self.read_cell();
         println!("{:?}", cell);
-        let extended2 = match cell.command {
+        let relay_cell = match cell.command {
             types::Command::Relay => self.decrypt_cell_bytes(circ_id, &cell.payload),
             _ => panic!("expected RELAY, got {:?}", cell.command),
         };
-        println!("{}", extended2);
+        println!("{}", relay_cell);
+        let extended2 = match relay_cell.relay_command {
+            types::RelayCommand::Extended2 =>
+                // The contents of an EXTENDED2 relay cell is the same as a CREATED2 cell
+                types::Created2Cell::read_new(&mut &relay_cell.data[..]).unwrap(),
+            _ => panic!("expected EXTENDED2, got {:?}", relay_cell.relay_command),
+        };
+        let circuit_keys = ntor_handshake(
+            &extended2,
+            node.get_node_id(),
+            node.get_ntor_key(),
+            client_keypair.get_public_key_bytes(),
+            client_keypair.get_secret_key_bytes(),
+        ).unwrap();
     }
 
     fn handle_event(&mut self, event: &String) {
@@ -545,41 +559,15 @@ impl TorClient {
         }
     }
 
-    #[allow(non_snake_case)]
     fn do_ntor_handshake(&mut self, circ_id: u32, created2_cell: &types::Created2Cell) {
         if let Some(ref ntor_context) = self.ntor_contexts.get(&circ_id) {
-            println!("{:?}", created2_cell);
-            // technically we should check the corresponding create2_cell type here
-            let server_handshake =
-                types::NtorServerHandshake::read_new(&mut &created2_cell.h_data[..]).unwrap();
-            println!("{:?}", server_handshake);
-            let Y = montgomery::CompressedMontgomeryU(server_handshake.server_pk);
-            let x = scalar::Scalar::from_bits(ntor_context.client_x);
-            let exp_Y_x = curve25519_multiply(&Y, &x);
-            let B = montgomery::CompressedMontgomeryU(ntor_context.client_B);
-            let exp_B_x = curve25519_multiply(&B, &x);
-            let mut secret_input: Vec<u8> = Vec::new();
-            secret_input.extend(exp_Y_x.iter());
-            secret_input.extend(exp_B_x.iter());
-            secret_input.extend(ntor_context.router_id.iter());
-            secret_input.extend(ntor_context.client_B.iter());
-            secret_input.extend(ntor_context.client_X.iter());
-            secret_input.extend(server_handshake.server_pk.iter());
-            secret_input.extend("ntor-curve25519-sha256-1".as_bytes());
-            let verify = ntor_hmac(&secret_input, b"ntor-curve25519-sha256-1:verify");
-            let mut auth_input: Vec<u8> = Vec::new();
-            auth_input.extend(verify.iter());
-            auth_input.extend(ntor_context.router_id.iter());
-            auth_input.extend(ntor_context.client_B.iter());
-            auth_input.extend(server_handshake.server_pk.iter());
-            auth_input.extend(ntor_context.client_X.iter());
-            auth_input.extend("ntor-curve25519-sha256-1".as_bytes());
-            auth_input.extend("Server".as_bytes());
-            let calculated_auth = ntor_hmac(&auth_input, b"ntor-curve25519-sha256-1:mac");
-            if constant_time_eq(&calculated_auth, &server_handshake.auth) {
-                // so this is actually the prk in the kdf... (confusing documentation)
-                let key_seed = ntor_hmac(&secret_input, b"ntor-curve25519-sha256-1:key_extract");
-                let circuit_keys = compute_ntor_keys(&key_seed);
+            if let Ok(circuit_keys) = ntor_handshake(
+                created2_cell,
+                ntor_context.router_id,
+                ntor_context.client_B,
+                ntor_context.client_X,
+                ntor_context.client_x,
+            ) {
                 self.circuit_keys.insert(circ_id, circuit_keys);
             }
         }
@@ -901,8 +889,6 @@ fn tor_kdf(x: &[u8; 20], y: &[u8; 20], kh: &[u8; 20]) -> CircuitKeys {
     let kh_calculated = hash.digest().bytes();
     if !constant_time_eq(&kh_calculated, kh) {
         println!("didn't get the same kh?");
-        util::hexdump(kh);
-        util::hexdump(&kh_calculated);
     }
 
     let mut buffer: Vec<u8> = Vec::new();
@@ -913,4 +899,52 @@ fn tor_kdf(x: &[u8; 20], y: &[u8; 20], kh: &[u8; 20]) -> CircuitKeys {
         buffer.extend(hash.digest().bytes().iter());
     }
     CircuitKeys::new(&buffer)
+}
+
+#[allow(non_snake_case)]
+fn ntor_handshake(
+    created2_cell: &types::Created2Cell,
+    router_id: [u8; 20],
+    client_B: [u8; 32],
+    client_X: [u8; 32],
+    mut client_x: [u8; 32],
+) -> Result<CircuitKeys, ()> {
+    println!("{:?}", created2_cell);
+    // technically we should check the corresponding create2_cell type here
+    let server_handshake =
+        types::NtorServerHandshake::read_new(&mut &created2_cell.h_data[..]).unwrap();
+    println!("{:?}", server_handshake);
+    client_x[0] &= 248;
+    client_x[31] &= 127;
+    client_x[31] |= 64;
+    let Y = montgomery::CompressedMontgomeryU(server_handshake.server_pk);
+    let x = scalar::Scalar::from_bits(client_x);
+    let exp_Y_x = curve25519_multiply(&Y, &x);
+    let B = montgomery::CompressedMontgomeryU(client_B);
+    let exp_B_x = curve25519_multiply(&B, &x);
+    let mut secret_input: Vec<u8> = Vec::new();
+    secret_input.extend(exp_Y_x.iter());
+    secret_input.extend(exp_B_x.iter());
+    secret_input.extend(router_id.iter());
+    secret_input.extend(client_B.iter());
+    secret_input.extend(client_X.iter());
+    secret_input.extend(server_handshake.server_pk.iter());
+    secret_input.extend("ntor-curve25519-sha256-1".as_bytes());
+    let verify = ntor_hmac(&secret_input, b"ntor-curve25519-sha256-1:verify");
+    let mut auth_input: Vec<u8> = Vec::new();
+    auth_input.extend(verify.iter());
+    auth_input.extend(router_id.iter());
+    auth_input.extend(client_B.iter());
+    auth_input.extend(server_handshake.server_pk.iter());
+    auth_input.extend(client_X.iter());
+    auth_input.extend("ntor-curve25519-sha256-1".as_bytes());
+    auth_input.extend("Server".as_bytes());
+    let calculated_auth = ntor_hmac(&auth_input, b"ntor-curve25519-sha256-1:mac");
+    if constant_time_eq(&calculated_auth, &server_handshake.auth) {
+        // so this is actually the prk in the kdf... (confusing documentation)
+        let key_seed = ntor_hmac(&secret_input, b"ntor-curve25519-sha256-1:key_extract");
+        Ok(compute_ntor_keys(&key_seed))
+    } else {
+        Err(())
+    }
 }

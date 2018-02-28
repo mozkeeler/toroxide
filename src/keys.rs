@@ -1,4 +1,6 @@
 use byteorder::{NetworkEndian, WriteBytesExt};
+use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::constants::BASE_COMPRESSED_MONTGOMERY;
 use ed25519_dalek::{Keypair, PublicKey, Signature};
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
@@ -7,8 +9,9 @@ use openssl::pkey::{PKey, Private, Public};
 use openssl::rand::rand_bytes;
 use openssl::rsa::{Padding, Rsa};
 use openssl::x509::{X509Builder, X509NameBuilder};
-use rand::OsRng;
+use rand::{OsRng, Rng};
 use sha2::Sha512;
+use std::ops::Mul;
 
 use certs;
 
@@ -195,6 +198,10 @@ impl Ed25519Key {
         self.key.public.to_bytes()
     }
 
+    pub fn get_private_key_bytes(&self) -> [u8; 32] {
+        self.key.secret.to_bytes()
+    }
+
     pub fn sign_data(&self, data: &[u8]) -> [u8; 64] {
         self.key.sign::<Sha512>(data).to_bytes()
     }
@@ -225,5 +232,38 @@ impl Ed25519PublicKey {
 
     pub fn matches_expected_key(&self, expected_bytes: &[u8; 32]) -> bool {
         self.key.as_bytes() == expected_bytes
+    }
+}
+
+pub struct Curve25519Keypair {
+    secret_bytes: [u8; 32],
+    public_bytes: [u8; 32],
+}
+
+impl Curve25519Keypair {
+    pub fn new() -> Curve25519Keypair {
+        let mut csprng: OsRng = OsRng::new().unwrap();
+        let mut secret_bytes: [u8; 32] = [0; 32];
+        csprng.fill_bytes(&mut secret_bytes);
+        // Magical clamping - apparently prevents some attacks and bugs.
+        secret_bytes[0] &= 248;
+        secret_bytes[31] &= 127;
+        secret_bytes[31] |= 64;
+        let nine = BASE_COMPRESSED_MONTGOMERY.decompress();
+        let secret_bytes_as_scalar = Scalar::from_bits(secret_bytes.clone());
+        let result = nine.mul(&secret_bytes_as_scalar);
+        let public_bytes = result.compress().to_bytes();
+        Curve25519Keypair {
+            secret_bytes: secret_bytes,
+            public_bytes: public_bytes,
+        }
+    }
+
+    pub fn get_public_key_bytes(&self) -> [u8; 32] {
+        self.public_bytes.clone()
+    }
+
+    pub fn get_secret_key_bytes(&self) -> [u8; 32] {
+        self.secret_bytes.clone()
     }
 }

@@ -39,28 +39,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct TorClient {
     /// Maybe a TLS connection with a peer.
     tls_connection: Option<tls::TlsConnection>,
-    /// Map of circuit id to NtorContext
-    ntor_contexts: HashMap<u32, NtorContext>,
-    /// Created NtorContext that we don't know what circuit id it's for yet
-    pending_ntor_context: Option<NtorContext>,
     /// Map of circuit id to CircuitKeys
     circuit_keys: HashMap<u32, CircuitKeys>,
     /// Maybe the certs parsed and validated from a peer's CERTS cell
     responder_certs: Option<ResponderCerts>,
     /// A set indicating the circuit IDs that have been used.
     used_circ_ids: HashSet<u32>,
-}
-
-#[allow(non_snake_case)]
-struct NtorContext {
-    /// The SHA-1 hash of the router's RSA key
-    router_id: [u8; 20],
-    /// The router's ntor onion key "B" (public)
-    client_B: [u8; 32],
-    /// The ntor handshake public key "X"
-    client_X: [u8; 32],
-    /// The ntor handshake private key "x"
-    client_x: [u8; 32],
 }
 
 struct AesContext {
@@ -133,30 +117,10 @@ fn main() {
     tor_client.extend(&peers[1], circ_id);
 }
 
-fn debug_dump_from_stdin() {
-    let mut tor_client = TorClient::new();
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line.unwrap();
-        if line.len() == 0 {
-            break;
-        }
-        tor_client.handle_event(&line);
-    }
-}
-
-#[derive(Debug)]
-enum Direction {
-    Incoming,
-    Outgoing,
-}
-
 impl TorClient {
     fn new() -> TorClient {
         TorClient {
             tls_connection: None,
-            ntor_contexts: HashMap::new(),
-            pending_ntor_context: None,
             circuit_keys: HashMap::new(),
             responder_certs: None,
             used_circ_ids: HashSet::new(),
@@ -483,132 +447,6 @@ impl TorClient {
         ).unwrap();
     }
 
-    fn handle_event(&mut self, event: &String) {
-        let parts: Vec<_> = event.split(":").collect();
-        match parts[0] {
-            "keygen" => self.decode_keygen(&parts[1..]),
-            "read" => self.decode_cell_hex(Direction::Incoming, parts[1]),
-            "write" => self.decode_cell_hex(Direction::Outgoing, parts[1]),
-            _ => println!("unknown operation {}", parts[0]),
-        }
-    }
-
-    fn decode_keygen(&mut self, keys_hex: &[&str]) {
-        self.pending_ntor_context = Some(NtorContext {
-            router_id: util::slice_to_20_byte_array(&hex::decode(keys_hex[0]).unwrap()),
-            client_B: util::slice_to_32_byte_array(&hex::decode(keys_hex[1]).unwrap()),
-            client_X: util::slice_to_32_byte_array(&hex::decode(keys_hex[2]).unwrap()),
-            client_x: util::slice_to_32_byte_array(&hex::decode(keys_hex[3]).unwrap()),
-        });
-    }
-
-    fn decode_cell_hex(&mut self, direction: Direction, cell_hex: &str) {
-        let mut bytes = &hex::decode(cell_hex).unwrap()[..];
-        self.decode_input(direction, &mut bytes);
-    }
-
-    fn decode_input<R: Read>(&mut self, direction: Direction, input: &mut R) {
-        let tor_cell = types::Cell::read_new(input).unwrap();
-        println!("{:?}", tor_cell);
-        match tor_cell.command {
-            types::Command::Relay => {
-                self.handle_encrypted_relay_cell(tor_cell.circ_id, direction, &tor_cell.payload);
-            }
-            types::Command::Netinfo => {
-                match types::NetinfoCell::read_new(&mut &tor_cell.payload[..]) {
-                    Ok(netinfo_cell) => {
-                        println!("{:?}", netinfo_cell);
-                    }
-                    Err(msg) => println!("{}", msg),
-                }
-            }
-            types::Command::Create2 => {
-                match types::Create2Cell::read_new(&mut &tor_cell.payload[..]) {
-                    Ok(create2_cell) => {
-                        println!("{:?}", create2_cell);
-                        // technically we should check create2_cell.h_type here
-                        let client_handshake = types::NtorClientHandshake::read_new(
-                            &mut create2_cell.get_h_data(),
-                        ).unwrap();
-                        println!("{:?}", client_handshake);
-                        if let Some(pending_ntor_context) = self.pending_ntor_context.take() {
-                            self.ntor_contexts
-                                .insert(tor_cell.circ_id, pending_ntor_context);
-                        }
-                    }
-                    Err(msg) => println!("{}", msg),
-                }
-            }
-            types::Command::Created2 => {
-                match types::Created2Cell::read_new(&mut &tor_cell.payload[..]) {
-                    Ok(created2_cell) => self.do_ntor_handshake(tor_cell.circ_id, &created2_cell),
-                    Err(msg) => println!("{}", msg),
-                }
-            }
-            types::Command::Certs => match types::CertsCell::read_new(&mut &tor_cell.payload[..]) {
-                Ok(certs_cell) => println!("{:?}", certs_cell),
-                Err(msg) => println!("{}", msg),
-            },
-            types::Command::AuthChallenge => {
-                match types::AuthChallengeCell::read_new(&mut &tor_cell.payload[..]) {
-                    Ok(auth_challenge_cell) => println!("{:?}", auth_challenge_cell),
-                    Err(msg) => println!("{}", msg),
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn do_ntor_handshake(&mut self, circ_id: u32, created2_cell: &types::Created2Cell) {
-        if let Some(ref ntor_context) = self.ntor_contexts.get(&circ_id) {
-            if let Ok(circuit_keys) = ntor_handshake(
-                created2_cell,
-                ntor_context.router_id,
-                ntor_context.client_B,
-                ntor_context.client_X,
-                ntor_context.client_x,
-            ) {
-                self.circuit_keys.insert(circ_id, circuit_keys);
-            }
-        }
-    }
-
-    fn handle_encrypted_relay_cell(
-        &mut self,
-        circ_id: u32,
-        direction: Direction,
-        encrypted_relay_cell: &[u8],
-    ) {
-        let bytes = if let Some(ref mut circuit_keys) = self.circuit_keys.get_mut(&circ_id) {
-            let mut decrypted_relay_cell: Vec<u8> = Vec::with_capacity(encrypted_relay_cell.len());
-            decrypted_relay_cell.resize(encrypted_relay_cell.len(), 0);
-            // So we have to have some way to roll back things that weren't actually for us (or
-            // attacks that would attempt to modify our counter...)
-            // It seems the canonical implementation just kills the connection if this ever happens.
-            let aes_context = match direction {
-                Direction::Incoming => &mut circuit_keys.backward_key,
-                Direction::Outgoing => &mut circuit_keys.forward_key,
-            };
-            aes_context
-                .aes
-                .process(encrypted_relay_cell, &mut decrypted_relay_cell);
-            decrypted_relay_cell
-        } else {
-            return;
-        };
-        match types::RelayCell::read_new(&mut &bytes[..]) {
-            Ok(relay_cell) => self.handle_relay_cell(circ_id, direction, relay_cell),
-            Err(err) => println!("{}", err),
-        };
-    }
-
-    fn handle_relay_cell(&self, circ_id: u32, direction: Direction, relay_cell: types::RelayCell) {
-        println!(
-            "handle_relay_cell({}, {:?}, {}",
-            circ_id, direction, relay_cell
-        );
-    }
-
     /// Generates a new, nonzero, random circuit id that hasn't been used before or panics.
     fn get_new_circ_id(&mut self) -> u32 {
         const RETRY_LIMIT: usize = 1024;
@@ -905,7 +743,7 @@ fn tor_kdf(x: &[u8; 20], y: &[u8; 20], kh: &[u8; 20]) -> CircuitKeys {
 fn ntor_handshake(
     created2_cell: &types::Created2Cell,
     router_id: [u8; 20],
-    client_B: [u8; 32],
+    server_B: [u8; 32],
     client_X: [u8; 32],
     mut client_x: [u8; 32],
 ) -> Result<CircuitKeys, ()> {
@@ -920,13 +758,13 @@ fn ntor_handshake(
     let Y = montgomery::CompressedMontgomeryU(server_handshake.server_pk);
     let x = scalar::Scalar::from_bits(client_x);
     let exp_Y_x = curve25519_multiply(&Y, &x);
-    let B = montgomery::CompressedMontgomeryU(client_B);
+    let B = montgomery::CompressedMontgomeryU(server_B);
     let exp_B_x = curve25519_multiply(&B, &x);
     let mut secret_input: Vec<u8> = Vec::new();
     secret_input.extend(exp_Y_x.iter());
     secret_input.extend(exp_B_x.iter());
     secret_input.extend(router_id.iter());
-    secret_input.extend(client_B.iter());
+    secret_input.extend(server_B.iter());
     secret_input.extend(client_X.iter());
     secret_input.extend(server_handshake.server_pk.iter());
     secret_input.extend("ntor-curve25519-sha256-1".as_bytes());
@@ -934,7 +772,7 @@ fn ntor_handshake(
     let mut auth_input: Vec<u8> = Vec::new();
     auth_input.extend(verify.iter());
     auth_input.extend(router_id.iter());
-    auth_input.extend(client_B.iter());
+    auth_input.extend(server_B.iter());
     auth_input.extend(server_handshake.server_pk.iter());
     auth_input.extend(client_X.iter());
     auth_input.extend("ntor-curve25519-sha256-1".as_bytes());
@@ -946,5 +784,180 @@ fn ntor_handshake(
         Ok(compute_ntor_keys(&key_seed))
     } else {
         Err(())
+    }
+}
+
+fn debug_dump_from_stdin() {
+    let mut tor_parser = TorParser::new();
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line.unwrap();
+        if line.len() == 0 {
+            break;
+        }
+        tor_parser.handle_event(&line);
+    }
+}
+
+#[allow(non_snake_case)]
+struct NtorContext {
+    /// The SHA-1 hash of the router's RSA key
+    router_id: [u8; 20],
+    /// The router's ntor onion key "B" (public)
+    server_B: [u8; 32],
+    /// The ntor handshake public key "X"
+    client_X: [u8; 32],
+    /// The ntor handshake private key "x"
+    client_x: [u8; 32],
+}
+
+#[derive(Debug)]
+enum Direction {
+    Incoming,
+    Outgoing,
+}
+
+struct TorParser {
+    /// Map of circuit id to NtorContext
+    ntor_contexts: HashMap<u32, NtorContext>,
+    /// Created NtorContext that we don't know what circuit id it's for yet
+    pending_ntor_context: Option<NtorContext>,
+    /// Map of circuit id to CircuitKeys
+    circuit_keys: HashMap<u32, CircuitKeys>,
+}
+
+impl TorParser {
+    fn new() -> TorParser {
+        TorParser {
+            ntor_contexts: HashMap::new(),
+            pending_ntor_context: None,
+            circuit_keys: HashMap::new(),
+        }
+    }
+
+    fn handle_event(&mut self, event: &String) {
+        let parts: Vec<_> = event.split(":").collect();
+        match parts[0] {
+            "keygen" => self.decode_keygen(&parts[1..]),
+            "read" => self.decode_cell_hex(Direction::Incoming, parts[1]),
+            "write" => self.decode_cell_hex(Direction::Outgoing, parts[1]),
+            _ => println!("unknown operation {}", parts[0]),
+        }
+    }
+
+    fn decode_keygen(&mut self, keys_hex: &[&str]) {
+        self.pending_ntor_context = Some(NtorContext {
+            router_id: util::slice_to_20_byte_array(&hex::decode(keys_hex[0]).unwrap()),
+            server_B: util::slice_to_32_byte_array(&hex::decode(keys_hex[1]).unwrap()),
+            client_X: util::slice_to_32_byte_array(&hex::decode(keys_hex[2]).unwrap()),
+            client_x: util::slice_to_32_byte_array(&hex::decode(keys_hex[3]).unwrap()),
+        });
+    }
+
+    fn decode_cell_hex(&mut self, direction: Direction, cell_hex: &str) {
+        let mut bytes = &hex::decode(cell_hex).unwrap()[..];
+        self.decode_input(direction, &mut bytes);
+    }
+
+    fn decode_input<R: Read>(&mut self, direction: Direction, input: &mut R) {
+        let tor_cell = types::Cell::read_new(input).unwrap();
+        println!("{:?}", tor_cell);
+        match tor_cell.command {
+            types::Command::Relay => {
+                self.handle_encrypted_relay_cell(tor_cell.circ_id, direction, &tor_cell.payload);
+            }
+            types::Command::Netinfo => {
+                match types::NetinfoCell::read_new(&mut &tor_cell.payload[..]) {
+                    Ok(netinfo_cell) => {
+                        println!("{:?}", netinfo_cell);
+                    }
+                    Err(msg) => println!("{}", msg),
+                }
+            }
+            types::Command::Create2 => {
+                match types::Create2Cell::read_new(&mut &tor_cell.payload[..]) {
+                    Ok(create2_cell) => {
+                        println!("{:?}", create2_cell);
+                        // technically we should check create2_cell.h_type here
+                        let client_handshake = types::NtorClientHandshake::read_new(
+                            &mut create2_cell.get_h_data(),
+                        ).unwrap();
+                        println!("{:?}", client_handshake);
+                        if let Some(pending_ntor_context) = self.pending_ntor_context.take() {
+                            self.ntor_contexts
+                                .insert(tor_cell.circ_id, pending_ntor_context);
+                        }
+                    }
+                    Err(msg) => println!("{}", msg),
+                }
+            }
+            types::Command::Created2 => {
+                match types::Created2Cell::read_new(&mut &tor_cell.payload[..]) {
+                    Ok(created2_cell) => self.do_ntor_handshake(tor_cell.circ_id, &created2_cell),
+                    Err(msg) => println!("{}", msg),
+                }
+            }
+            types::Command::Certs => match types::CertsCell::read_new(&mut &tor_cell.payload[..]) {
+                Ok(certs_cell) => println!("{:?}", certs_cell),
+                Err(msg) => println!("{}", msg),
+            },
+            types::Command::AuthChallenge => {
+                match types::AuthChallengeCell::read_new(&mut &tor_cell.payload[..]) {
+                    Ok(auth_challenge_cell) => println!("{:?}", auth_challenge_cell),
+                    Err(msg) => println!("{}", msg),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn do_ntor_handshake(&mut self, circ_id: u32, created2_cell: &types::Created2Cell) {
+        if let Some(ref ntor_context) = self.ntor_contexts.get(&circ_id) {
+            if let Ok(circuit_keys) = ntor_handshake(
+                created2_cell,
+                ntor_context.router_id,
+                ntor_context.server_B,
+                ntor_context.client_X,
+                ntor_context.client_x,
+            ) {
+                self.circuit_keys.insert(circ_id, circuit_keys);
+            }
+        }
+    }
+
+    fn handle_encrypted_relay_cell(
+        &mut self,
+        circ_id: u32,
+        direction: Direction,
+        encrypted_relay_cell: &[u8],
+    ) {
+        let bytes = if let Some(ref mut circuit_keys) = self.circuit_keys.get_mut(&circ_id) {
+            let mut decrypted_relay_cell: Vec<u8> = Vec::with_capacity(encrypted_relay_cell.len());
+            decrypted_relay_cell.resize(encrypted_relay_cell.len(), 0);
+            // So we have to have some way to roll back things that weren't actually for us (or
+            // attacks that would attempt to modify our counter...)
+            // It seems the canonical implementation just kills the connection if this ever happens.
+            let aes_context = match direction {
+                Direction::Incoming => &mut circuit_keys.backward_key,
+                Direction::Outgoing => &mut circuit_keys.forward_key,
+            };
+            aes_context
+                .aes
+                .process(encrypted_relay_cell, &mut decrypted_relay_cell);
+            decrypted_relay_cell
+        } else {
+            return;
+        };
+        match types::RelayCell::read_new(&mut &bytes[..]) {
+            Ok(relay_cell) => self.handle_relay_cell(circ_id, direction, relay_cell),
+            Err(err) => println!("{}", err),
+        };
+    }
+
+    fn handle_relay_cell(&self, circ_id: u32, direction: Direction, relay_cell: types::RelayCell) {
+        println!(
+            "handle_relay_cell({}, {:?}, {}",
+            circ_id, direction, relay_cell
+        );
     }
 }

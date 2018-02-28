@@ -125,7 +125,7 @@ fn main() {
     let mut tor_client = TorClient::new();
     tor_client.connect_to(&peers[0]);
     tor_client.negotiate_versions();
-    tor_client.read_certs();
+    tor_client.read_certs(&peers[0].get_ed25519_id_key());
     tor_client.read_auth_challenge();
     tor_client.send_certs_and_authenticate_cells();
     tor_client.read_netinfo();
@@ -184,7 +184,7 @@ impl TorClient {
         println!("negotiated version {}", version);
     }
 
-    fn read_certs(&mut self) {
+    fn read_certs(&mut self, expected_ed25519_id_key: &[u8; 32]) {
         let mut connection = match self.tls_connection {
             Some(ref mut connection) => connection,
             None => panic!("invalid state - call connect_to first"),
@@ -196,7 +196,7 @@ impl TorClient {
                 Ok(certs_cell) => {
                     let responder_certs = ResponderCerts::new(certs_cell.decode_certs()).unwrap();
                     if responder_certs
-                        .validate(connection.get_peer_cert_hash())
+                        .validate(expected_ed25519_id_key, connection.get_peer_cert_hash())
                         .is_ok()
                     {
                         self.responder_certs = Some(responder_certs);
@@ -769,14 +769,17 @@ impl ResponderCerts {
         })
     }
 
-    fn validate(&self, peer_cert_hash: Vec<u8>) -> Result<(), &'static str> {
+    fn validate(
+        &self,
+        expected_ed25519_id_key: &[u8; 32],
+        peer_cert_hash: Vec<u8>,
+    ) -> Result<(), &'static str> {
         // Need to check:
         // rsa_identity_cert is self-signed
         if !self.rsa_identity_cert.is_self_signed() {
             return Err("RSA identity cert is not self-signed");
         }
         // rsa identity key (in rsa_identity_cert) signed ed25519_identity_cert, is 1024 bits
-        // TODO: verify that this matches the node id?
         let identity_key = self.rsa_identity_cert.get_key();
         if !identity_key.check_ed25519_identity_signature(&self.ed25519_identity_cert) {
             return Err("RSA identity cert did not sign Ed25519 identity cert");
@@ -786,6 +789,9 @@ impl ResponderCerts {
         }
         // ed25519 identity key (in ed25519_identity_cert) signed ed25519_signing_cert
         let ed25519_identity_key = self.ed25519_identity_cert.get_key();
+        if !ed25519_identity_key.matches_expected_key(expected_ed25519_id_key) {
+            return Err("Ed25519 identity key does not match the expected key");
+        }
         if !ed25519_identity_key.check_ed25519_signature(&self.ed25519_signing_cert) {
             return Err("Ed25519 identity key did not sign Ed25519 signing cert");
         }

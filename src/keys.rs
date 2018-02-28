@@ -222,4 +222,8 @@ impl Ed25519PublicKey {
         let signature = Signature::from_bytes(ed25519_cert.get_signature()).unwrap();
         self.key.verify::<Sha512>(&to_verify, &signature)
     }
+
+    pub fn matches_expected_key(&self, expected_bytes: &[u8; 32]) -> bool {
+        self.key.as_bytes() == expected_bytes
+    }
 }

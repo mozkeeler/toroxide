@@ -47,6 +47,8 @@ struct Circuit {
     circuit_keys: Vec<CircuitKeys>,
     /// Stream IDs that have been used
     used_stream_ids: IdTracker<u16>,
+    /// How many times we've used RELAY_EARLY.
+    relay_early_count: usize,
 }
 
 /// Generates unique IDs.
@@ -141,8 +143,18 @@ fn main() {
     let response = circuit.recv();
     print!("{}", String::from_utf8(response).unwrap());
     circuit.end(stream_id);
+
     let stream_id = circuit.begin("127.0.0.1:3000");
     circuit.send(stream_id, "world\n".as_bytes());
+    let response = circuit.recv();
+    print!("{}", String::from_utf8(response).unwrap());
+    circuit.end(stream_id);
+
+    let stream_id = circuit.begin("127.0.0.1:3000");
+    circuit.send(
+        stream_id,
+        "this is a bit longer of a string but still not that long\n".as_bytes(),
+    );
     let response = circuit.recv();
     print!("{}", String::from_utf8(response).unwrap());
     circuit.end(stream_id);
@@ -157,6 +169,7 @@ impl Circuit {
             responder_certs: None,
             circuit_keys: Vec::new(),
             used_stream_ids: IdTracker::new(),
+            relay_early_count: 0,
         }
     }
 
@@ -406,7 +419,13 @@ impl Circuit {
         types::RelayCell::read_new(&mut &bytes[..]).unwrap()
     }
 
-    fn send_cell_bytes(&mut self, command: types::Command, bytes: Vec<u8>) {
+    fn send_cell_bytes(&mut self, bytes: Vec<u8>) {
+        let command = if self.relay_early_count < 8 {
+            self.relay_early_count += 1;
+            types::Command::RelayEarly
+        } else {
+            types::Command::Relay
+        };
         let cell = types::Cell::new(self.circ_id, command, bytes);
         cell.write_to(&mut self.tls_connection).unwrap();
     }
@@ -431,8 +450,7 @@ impl Circuit {
         let mut extend2_bytes = Vec::new();
         extend2.write_to(&mut extend2_bytes).unwrap();
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Extend2, &extend2_bytes, 0);
-        // EXTEND cells must always be sent in RELAY_EARLY cells(?)
-        self.send_cell_bytes(types::Command::RelayEarly, bytes);
+        self.send_cell_bytes(bytes);
         let cell = self.read_cell();
         println!("{:?}", cell);
         let relay_cell = match cell.command {
@@ -467,9 +485,7 @@ impl Circuit {
         begin.write_to(&mut begin_bytes).unwrap();
         let stream_id = self.used_stream_ids.get_new_id();
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Begin, &begin_bytes, stream_id);
-        // The first 8 or so relay cells need to be RELAY_EARLY, so we need to keep track of this
-        // and switch over as appropriate.
-        self.send_cell_bytes(types::Command::RelayEarly, bytes);
+        self.send_cell_bytes(bytes);
         let cell = self.read_cell();
         println!("{:?}", cell);
         let relay_cell = match cell.command {
@@ -483,7 +499,7 @@ impl Circuit {
 
     fn send(&mut self, stream_id: u16, data: &[u8]) {
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, data, stream_id);
-        self.send_cell_bytes(types::Command::RelayEarly, bytes);
+        self.send_cell_bytes(bytes);
     }
 
     // stream_id?
@@ -504,7 +520,7 @@ impl Circuit {
     fn end(&mut self, stream_id: u16) {
         let data = [6]; // REASON_DONE
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, &data, stream_id);
-        self.send_cell_bytes(types::Command::RelayEarly, bytes);
+        self.send_cell_bytes(bytes);
         let cell = self.read_cell();
         println!("{:?}", cell);
         let relay_cell = match cell.command {

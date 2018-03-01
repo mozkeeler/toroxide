@@ -8,6 +8,7 @@ extern crate ed25519_dalek;
 extern crate getopts;
 extern crate hex;
 extern crate hmac;
+extern crate num;
 extern crate openssl;
 extern crate rand;
 extern crate sha1;
@@ -26,11 +27,13 @@ use curve25519_dalek::montgomery;
 use curve25519_dalek::scalar;
 use getopts::Options;
 use hmac::{Hmac, Mac};
-use rand::{OsRng, Rng};
+use num::PrimInt;
+use rand::{OsRng, Rand, Rng};
 use sha1::Sha1;
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::hash::Hash;
 use std::io::prelude::*;
 use std::io;
 use std::ops::Mul;
@@ -45,31 +48,43 @@ struct Circuit {
     responder_certs: Option<ResponderCerts>,
     /// Sequence of CircuitKeys for each hop in this circuit.
     circuit_keys: Vec<CircuitKeys>,
+    /// Stream IDs that have been used
+    used_stream_ids: IdTracker<u16>,
 }
 
-struct CircuitIdTracker {
-    /// A set indicating the circuit IDs that have been used.
-    used_circ_ids: HashSet<u32>,
+/// Generates unique IDs.
+struct IdTracker<T>
+where
+    T: PrimInt + Hash + Rand,
+{
+    /// A set indicating the IDs that have been used.
+    used_ids: HashSet<T>,
 }
 
-impl CircuitIdTracker {
-    fn new() -> CircuitIdTracker {
-        CircuitIdTracker {
-            used_circ_ids: HashSet::new(),
+impl<T> IdTracker<T>
+where
+    T: PrimInt + Hash + Rand,
+{
+    fn new() -> IdTracker<T> {
+        IdTracker {
+            used_ids: HashSet::new(),
         }
     }
 
-    /// Generates a new, nonzero, random circuit id that hasn't been used before or panics.
-    fn get_new_circ_id(&mut self) -> u32 {
+    /// Generates a new, nonzero, random id with the highest bit set that hasn't been used before or
+    /// panics.
+    fn get_new_id(&mut self) -> T {
         const RETRY_LIMIT: usize = 1024;
         let mut csprng: OsRng = OsRng::new().unwrap();
         let mut retries = RETRY_LIMIT;
         while retries > 0 {
             // We need to set the highest bit because we're initiating the connection.
-            let new_circ_id: u32 = csprng.gen::<u32>() | 0x8000_0000;
+            // Technically we only need to do this for circuit IDs, but having this implementation
+            // be generic is nice and it doesn't mean anything for stream IDs.
+            let new_id = csprng.gen::<T>() | (!T::zero() & !(!T::zero() >> 1));
             // HashSet.insert returns true if the value was not already present and false otherwise.
-            if self.used_circ_ids.insert(new_circ_id) {
-                return new_circ_id;
+            if self.used_ids.insert(new_id) {
+                return new_id;
             }
             retries -= 1;
         }
@@ -136,8 +151,8 @@ fn main() {
 
     let peers = dir::get_tor_peers();
     println!("{:?}", peers);
-    let mut circ_id_tracker = CircuitIdTracker::new();
-    let circ_id = circ_id_tracker.get_new_circ_id();
+    let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
+    let circ_id = circ_id_tracker.get_new_id();
     let mut circuit = Circuit::new(&peers[0], circ_id);
     circuit.negotiate_versions();
     circuit.read_certs(&peers[0].get_ed25519_id_key());
@@ -149,6 +164,14 @@ fn main() {
     circuit.extend(&peers[3]);
     let stream_id = circuit.begin("127.0.0.1:3000");
     circuit.send(stream_id, "hello\n".as_bytes());
+    let response = circuit.recv();
+    print!("{}", String::from_utf8(response).unwrap());
+    circuit.end(stream_id);
+    let stream_id = circuit.begin("127.0.0.1:3000");
+    circuit.send(stream_id, "world\n".as_bytes());
+    let response = circuit.recv();
+    print!("{}", String::from_utf8(response).unwrap());
+    circuit.end(stream_id);
 }
 
 impl Circuit {
@@ -159,6 +182,7 @@ impl Circuit {
             circ_id: circ_id,
             responder_certs: None,
             circuit_keys: Vec::new(),
+            used_stream_ids: IdTracker::new(),
         }
     }
 
@@ -467,7 +491,7 @@ impl Circuit {
         // if I defined a trait...?
         let mut begin_bytes: Vec<u8> = Vec::new();
         begin.write_to(&mut begin_bytes).unwrap();
-        let stream_id = 1;
+        let stream_id = self.used_stream_ids.get_new_id();
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Begin, &begin_bytes, stream_id);
         // The first 8 or so relay cells need to be RELAY_EARLY, so we need to keep track of this
         // and switch over as appropriate.
@@ -488,6 +512,10 @@ impl Circuit {
     fn send(&mut self, stream_id: u16, data: &[u8]) {
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, data, stream_id);
         self.send_cell_bytes(types::Command::RelayEarly, bytes);
+    }
+
+    // stream_id?
+    fn recv(&mut self) -> Vec<u8> {
         let cell = self.read_cell();
         println!("{:?}", cell);
         let relay_cell = match cell.command {
@@ -495,6 +523,27 @@ impl Circuit {
             _ => panic!("expected RELAY, got {:?}", cell.command),
         };
         println!("{}", relay_cell);
+        match relay_cell.relay_command {
+            types::RelayCommand::Data => relay_cell.data,
+            _ => panic!("expected DATA, got {:?}", relay_cell.relay_command),
+        }
+    }
+
+    fn end(&mut self, stream_id: u16) {
+        let data = [6]; // REASON_DONE
+        let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, &data, stream_id);
+        self.send_cell_bytes(types::Command::RelayEarly, bytes);
+        let cell = self.read_cell();
+        println!("{:?}", cell);
+        let relay_cell = match cell.command {
+            types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
+            _ => panic!("expected RELAY, got {:?}", cell.command),
+        };
+        println!("{}", relay_cell);
+        match relay_cell.relay_command {
+            types::RelayCommand::End => println!("received RELAY_END: {}", relay_cell.data[0]),
+            _ => panic!("expected RELAY_END, got {:?}", relay_cell.relay_command),
+        }
     }
 }
 

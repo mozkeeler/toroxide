@@ -1013,4 +1013,7 @@ impl BeginCell {
 pub struct ConnectedCell {
 
 }
+
+pub enum RelayEndReason {
+}
 */

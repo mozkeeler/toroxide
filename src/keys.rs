@@ -215,15 +215,30 @@ impl Ed25519PublicKey {
     }
 
     pub fn check_ed25519_signature(&self, ed25519_cert: &certs::Ed25519Cert) -> bool {
-        // TODO: check that self.key is what's in ed25519_cert's key-identifying-extension, if
-        // present
         let mut to_verify: Vec<u8> = Vec::new();
         // Yeah so cert-spec.txt section 2.1 is just flat out wrong - there is no prefix and the
         // string "Tor node signing key certificate v1" appears nowhere in the tor codebase.
         //to_verify.extend(b"Tor node signing key certificate v1".iter().cloned());
         to_verify.extend(ed25519_cert.get_tbs_bytes());
         let signature = Signature::from_bytes(ed25519_cert.get_signature()).unwrap();
-        self.key.verify::<Sha512>(&to_verify, &signature)
+        if !self.key.verify::<Sha512>(&to_verify, &signature) {
+            return false;
+        }
+        for extension in ed25519_cert.get_extensions() {
+            match extension.ext_type {
+                certs::Ed25519CertExtensionType::SignedWithEd25519Key => {
+                    if extension.ext_data != self.key.as_bytes() {
+                        return false;
+                    }
+                }
+                _ => {
+                    if let certs::Ed25519CertExtensionFlags::Critical(_) = extension.ext_flags {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     pub fn matches_expected_key(&self, expected_bytes: &[u8; 32]) -> bool {

@@ -169,6 +169,10 @@ impl Ed25519Cert {
         }
         true
     }
+
+    pub fn get_extensions(&self) -> &[Ed25519CertExtension] {
+        &self.extensions
+    }
 }
 
 #[derive(Debug)]
@@ -236,9 +240,9 @@ impl Ed25519CertifiedKeyType {
 
 #[derive(Debug)]
 pub struct Ed25519CertExtension {
-    ext_type: Ed25519CertExtensionType,
-    ext_flags: Ed25519CertExtensionFlags,
-    ext_data: Vec<u8>,
+    pub ext_type: Ed25519CertExtensionType,
+    pub ext_flags: Ed25519CertExtensionFlags,
+    pub ext_data: Vec<u8>,
 }
 
 impl Ed25519CertExtension {
@@ -321,24 +325,29 @@ impl Ed25519CertExtensionType {
 // So I suppose technically Critical should be true if the 0th bit is set, maybe?
 #[derive(Debug)]
 pub enum Ed25519CertExtensionFlags {
+    /// No bits are set (i.e. 0).
     None,
-    Critical,
+    /// The 0th bit is set, and some others may be set (represented by the value held in the enum).
+    Critical(u8),
+    /// The 0th bit is not set, and some others may be set.
     Unknown(u8),
 }
 
 impl Ed25519CertExtensionFlags {
     fn from_u8(ext_flags: u8) -> Ed25519CertExtensionFlags {
-        match ext_flags {
-            0 => Ed25519CertExtensionFlags::None,
-            1 => Ed25519CertExtensionFlags::Critical,
-            _ => Ed25519CertExtensionFlags::Unknown(ext_flags),
+        if ext_flags == 0 {
+            Ed25519CertExtensionFlags::None
+        } else if ext_flags & 1 == 1 {
+            Ed25519CertExtensionFlags::Critical(ext_flags | 0b1111_1110)
+        } else {
+            Ed25519CertExtensionFlags::Unknown(ext_flags)
         }
     }
 
     fn as_u8(&self) -> u8 {
         match self {
             &Ed25519CertExtensionFlags::None => 0,
-            &Ed25519CertExtensionFlags::Critical => 1,
+            &Ed25519CertExtensionFlags::Critical(rest) => rest | 1,
             &Ed25519CertExtensionFlags::Unknown(val) => val,
         }
     }

@@ -36,15 +36,45 @@ use std::io;
 use std::ops::Mul;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-struct TorClient {
-    /// Maybe a TLS connection with a peer.
-    tls_connection: Option<tls::TlsConnection>,
-    /// Map of circuit id to CircuitKeys
-    circuit_keys: HashMap<u32, CircuitKeys>,
+struct Circuit {
+    /// TLS connection with the first hop in the circuit.
+    tls_connection: tls::TlsConnection,
+    /// The circuit ID for this connection.
+    circ_id: u32,
     /// Maybe the certs parsed and validated from a peer's CERTS cell
     responder_certs: Option<ResponderCerts>,
+    /// Sequence of CircuitKeys for each hop in this circuit.
+    circuit_keys: Vec<CircuitKeys>,
+}
+
+struct CircuitIdTracker {
     /// A set indicating the circuit IDs that have been used.
     used_circ_ids: HashSet<u32>,
+}
+
+impl CircuitIdTracker {
+    fn new() -> CircuitIdTracker {
+        CircuitIdTracker {
+            used_circ_ids: HashSet::new(),
+        }
+    }
+
+    /// Generates a new, nonzero, random circuit id that hasn't been used before or panics.
+    fn get_new_circ_id(&mut self) -> u32 {
+        const RETRY_LIMIT: usize = 1024;
+        let mut csprng: OsRng = OsRng::new().unwrap();
+        let mut retries = RETRY_LIMIT;
+        while retries > 0 {
+            // We need to set the highest bit because we're initiating the connection.
+            let new_circ_id: u32 = csprng.gen::<u32>() | 0x8000_0000;
+            // HashSet.insert returns true if the value was not already present and false otherwise.
+            if self.used_circ_ids.insert(new_circ_id) {
+                return new_circ_id;
+            }
+            retries -= 1;
+        }
+        panic!("couldn't generate new circuit id. (maybe implement gc?)");
+    }
 }
 
 struct AesContext {
@@ -106,61 +136,54 @@ fn main() {
 
     let peers = dir::get_tor_peers();
     println!("{:?}", peers);
-    let mut tor_client = TorClient::new();
-    tor_client.connect_to(&peers[0]);
-    tor_client.negotiate_versions();
-    tor_client.read_certs(&peers[0].get_ed25519_id_key());
-    tor_client.read_auth_challenge();
-    tor_client.send_certs_and_authenticate_cells();
-    tor_client.read_netinfo();
-    let circ_id = tor_client.create_fast();
-    tor_client.extend(&peers[1], circ_id);
+    let mut circ_id_tracker = CircuitIdTracker::new();
+    let circ_id = circ_id_tracker.get_new_circ_id();
+    let mut circuit = Circuit::new(&peers[0], circ_id);
+    circuit.negotiate_versions();
+    circuit.read_certs(&peers[0].get_ed25519_id_key());
+    circuit.read_auth_challenge();
+    circuit.send_certs_and_authenticate_cells();
+    circuit.read_netinfo();
+    circuit.create_fast();
+    circuit.extend(&peers[1]);
+    circuit.extend(&peers[2]);
 }
 
-impl TorClient {
-    fn new() -> TorClient {
-        TorClient {
-            tls_connection: None,
-            circuit_keys: HashMap::new(),
+impl Circuit {
+    fn new(peer: &dir::TorPeer, circ_id: u32) -> Circuit {
+        Circuit {
+            tls_connection: tls::TlsConnection::new(peer),
+            circ_id: circ_id,
             responder_certs: None,
-            used_circ_ids: HashSet::new(),
+            circuit_keys: Vec::new(),
         }
-    }
-
-    fn connect_to(&mut self, peer: &dir::TorPeer) {
-        self.tls_connection = Some(tls::TlsConnection::new(peer));
     }
 
     fn negotiate_versions(&mut self) {
         let versions = types::VersionsCell::new(vec![4]);
         let mut buf: Vec<u8> = Vec::new();
         versions.write_to(&mut buf).unwrap();
-        let mut connection = match self.tls_connection {
-            Some(ref mut connection) => connection,
-            None => panic!("invalid state - call connect_to first"),
-        };
-        match connection.write(&buf) {
+        match self.tls_connection.write(&buf) {
             Ok(len) => println!("sent {}", len),
             Err(e) => panic!(e),
         };
-        let peer_versions = types::VersionsCell::read_new(&mut connection).unwrap();
+        let peer_versions = types::VersionsCell::read_new(&mut self.tls_connection).unwrap();
         let version = versions.negotiate(&peer_versions).unwrap();
         println!("negotiated version {}", version);
     }
 
     fn read_certs(&mut self, expected_ed25519_id_key: &[u8; 32]) {
-        let mut connection = match self.tls_connection {
-            Some(ref mut connection) => connection,
-            None => panic!("invalid state - call connect_to first"),
-        };
         // Also assert versions negotiated?
-        let cell = types::Cell::read_new(&mut connection).unwrap();
+        let cell = types::Cell::read_new(&mut self.tls_connection).unwrap();
         match cell.command {
             types::Command::Certs => match types::CertsCell::read_new(&mut &cell.payload[..]) {
                 Ok(certs_cell) => {
                     let responder_certs = ResponderCerts::new(certs_cell.decode_certs()).unwrap();
                     if responder_certs
-                        .validate(expected_ed25519_id_key, connection.get_peer_cert_hash())
+                        .validate(
+                            expected_ed25519_id_key,
+                            self.tls_connection.get_peer_cert_hash(),
+                        )
                         .is_ok()
                     {
                         self.responder_certs = Some(responder_certs);
@@ -173,12 +196,8 @@ impl TorClient {
     }
 
     fn read_auth_challenge(&mut self) {
-        let mut connection = match self.tls_connection {
-            Some(ref mut connection) => connection,
-            None => panic!("invalid state - call connect_to first"),
-        };
         // Also assert everything beforehand...?
-        let cell = types::Cell::read_new(&mut connection).unwrap();
+        let cell = types::Cell::read_new(&mut self.tls_connection).unwrap();
         let auth_challenge = match cell.command {
             types::Command::AuthChallenge => {
                 match types::AuthChallengeCell::read_new(&mut &cell.payload[..]) {
@@ -198,16 +217,12 @@ impl TorClient {
     }
 
     fn send_certs_and_authenticate_cells(&mut self) {
-        let mut connection = match self.tls_connection {
-            Some(ref mut connection) => connection,
-            None => panic!("invalid state - call connect_to first"),
-        };
         let initiator_certs = InitiatorCerts::new();
         let certs_cell = initiator_certs.to_certs_cell();
         let mut buf: Vec<u8> = Vec::new();
         certs_cell.write_to(&mut buf).unwrap();
         let cell = types::Cell::new(0, types::Command::Certs, buf);
-        cell.write_to(&mut connection).unwrap();
+        cell.write_to(&mut self.tls_connection).unwrap();
 
         // tor-spec.txt section 4.4.2: With Ed25519-SHA256-RFC5705 link authentication, the
         // authentication field of the AUTHENTICATE cell is as follows:
@@ -258,18 +273,18 @@ impl TorClient {
         let sid_ed = responder_certs.ed25519_identity_cert.get_key_bytes();
         buf.extend(sid_ed);
         // SLOG (yes, the responder is first this time. don't know why)
-        let slog = connection.get_read_digest();
+        let slog = self.tls_connection.get_read_digest();
         buf.extend(slog);
         // CLOG
-        let clog = connection.get_write_digest();
+        let clog = self.tls_connection.get_write_digest();
         buf.extend(clog);
         // SCERT
-        let scert = connection.get_peer_cert_hash();
+        let scert = self.tls_connection.get_peer_cert_hash();
         buf.extend(scert);
         // TLSSECRETS
         // tor-spec.txt section 4.4.1 is wrong here - the context is the sha-256 hash of the
         // initiator's RSA identity cert (in other words, CID)
-        let tlssecrets = connection.get_tls_secrets(&cid);
+        let tlssecrets = self.tls_connection.get_tls_secrets(&cid);
         buf.extend(tlssecrets);
         // RAND
         let mut rand = [0; 24];
@@ -286,15 +301,11 @@ impl TorClient {
         let mut buf: Vec<u8> = Vec::new();
         authenticate_cell.write_to(&mut buf).unwrap();
         let cell = types::Cell::new(0, types::Command::Authenticate, buf);
-        cell.write_to(&mut connection).unwrap();
+        cell.write_to(&mut self.tls_connection).unwrap();
     }
 
     fn read_netinfo(&mut self) {
-        let mut connection = match self.tls_connection {
-            Some(ref mut connection) => connection,
-            None => panic!("invalid state - call connect_to first"),
-        };
-        let cell = types::Cell::read_new(&mut connection).unwrap();
+        let cell = types::Cell::read_new(&mut self.tls_connection).unwrap();
         println!("{:?}", cell);
         let netinfo = match cell.command {
             types::Command::Netinfo => match types::NetinfoCell::read_new(&mut &cell.payload[..]) {
@@ -315,25 +326,20 @@ impl TorClient {
         let mut buf: Vec<u8> = Vec::new();
         netinfo.write_to(&mut buf).unwrap();
         let cell = types::Cell::new(0, types::Command::Netinfo, buf);
-        cell.write_to(&mut connection).unwrap();
+        cell.write_to(&mut self.tls_connection).unwrap();
     }
 
-    fn create_fast(&mut self) -> u32 {
+    fn create_fast(&mut self) {
         let mut x = [0; 20];
         let mut csprng: OsRng = OsRng::new().unwrap();
         csprng.fill_bytes(&mut x);
         let create_fast_cell = types::CreateFastCell::new(x);
         let mut buf: Vec<u8> = Vec::new();
         create_fast_cell.write_to(&mut buf).unwrap();
-        let circ_id = self.get_new_circ_id();
-        let cell = types::Cell::new(circ_id, types::Command::CreateFast, buf);
+        let cell = types::Cell::new(self.circ_id, types::Command::CreateFast, buf);
 
-        let mut connection = match self.tls_connection {
-            Some(ref mut connection) => connection,
-            None => panic!("invalid state - call connect_to first"),
-        };
-        cell.write_to(&mut connection).unwrap();
-        let cell = types::Cell::read_new(&mut connection).unwrap();
+        cell.write_to(&mut self.tls_connection).unwrap();
+        let cell = types::Cell::read_new(&mut self.tls_connection).unwrap();
         println!("{:?}", cell);
         let circuit_keys = match cell.command {
             types::Command::CreatedFast => {
@@ -345,35 +351,41 @@ impl TorClient {
             types::Command::Destroy => panic!("got DESTROY cell"),
             _ => panic!("Expected CREATED_FAST or DESTROY, got {:?}", cell.command),
         };
-        self.circuit_keys.insert(circ_id, circuit_keys);
-        circ_id
+        self.circuit_keys.push(circuit_keys);
     }
 
     fn encrypt_cell_bytes(
         &mut self,
-        circ_id: u32,
         relay_command: types::RelayCommand,
         bytes: Vec<u8>,
     ) -> Vec<u8> {
-        if let Some(ref mut circuit_keys) = self.circuit_keys.get_mut(&circ_id) {
-            let mut relay_cell = types::RelayCell::new(relay_command, 0, bytes);
-            relay_cell.set_digest(&mut circuit_keys.forward_digest);
-            let mut buf = Vec::new();
-            relay_cell.write_to(&mut buf).unwrap();
-            let mut encrypted_bytes = Vec::with_capacity(buf.len());
-            encrypted_bytes.resize(buf.len(), 0);
+        let mut bytes = bytes.clone();
+        let mut first = true;
+        for circuit_keys in self.circuit_keys.iter_mut().rev() {
+            // TODO: this 0 may need to be something else in the future?
+            // (for non-command cells)
+            if first {
+                let mut relay_cell = types::RelayCell::new(relay_command.clone(), 0, bytes);
+                relay_cell.set_digest(&mut circuit_keys.forward_digest);
+                bytes = Vec::new();
+                relay_cell.write_to(&mut bytes).unwrap();
+                first = false;
+            }
+            let mut encrypted_bytes = Vec::with_capacity(bytes.len());
+            encrypted_bytes.resize(bytes.len(), 0);
             circuit_keys
                 .forward_key
                 .aes
-                .process(&buf, &mut encrypted_bytes);
-            encrypted_bytes
-        } else {
-            panic!("encrypt_cell_bytes given bogus circ_id?)");
+                .process(&bytes, &mut encrypted_bytes);
+            bytes = encrypted_bytes;
         }
+        bytes
     }
 
-    fn decrypt_cell_bytes(&mut self, circ_id: u32, bytes: &[u8]) -> types::RelayCell {
-        if let Some(ref mut circuit_keys) = self.circuit_keys.get_mut(&circ_id) {
+    fn decrypt_cell_bytes(&mut self, in_bytes: &[u8]) -> types::RelayCell {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(in_bytes);
+        for circuit_keys in self.circuit_keys.iter_mut() {
             let mut decrypted_cell_bytes: Vec<u8> = Vec::with_capacity(bytes.len());
             decrypted_cell_bytes.resize(bytes.len(), 0);
             // So we have to have some way to roll back things that weren't actually for us (or
@@ -382,32 +394,23 @@ impl TorClient {
             circuit_keys
                 .backward_key
                 .aes
-                .process(bytes, &mut decrypted_cell_bytes);
+                .process(&bytes, &mut decrypted_cell_bytes);
             // TODO: handle digest, things not for us, etc.
-            types::RelayCell::read_new(&mut &decrypted_cell_bytes[..]).unwrap()
-        } else {
-            panic!("decrypt_cell_bytes given bogus circ_id?)");
+            bytes = decrypted_cell_bytes;
         }
+        types::RelayCell::read_new(&mut &bytes[..]).unwrap()
     }
 
-    fn send_cell_bytes(&mut self, circ_id: u32, command: types::Command, bytes: Vec<u8>) {
-        let mut connection = match self.tls_connection {
-            Some(ref mut connection) => connection,
-            None => panic!("invalid state - call connect_to first"),
-        };
-        let cell = types::Cell::new(circ_id, command, bytes);
-        cell.write_to(&mut connection).unwrap();
+    fn send_cell_bytes(&mut self, command: types::Command, bytes: Vec<u8>) {
+        let cell = types::Cell::new(self.circ_id, command, bytes);
+        cell.write_to(&mut self.tls_connection).unwrap();
     }
 
     fn read_cell(&mut self) -> types::Cell {
-        let mut connection = match self.tls_connection {
-            Some(ref mut connection) => connection,
-            None => panic!("invalid state - call connect_to first"),
-        };
-        types::Cell::read_new(&mut connection).unwrap()
+        types::Cell::read_new(&mut self.tls_connection).unwrap()
     }
 
-    fn extend(&mut self, node: &dir::TorPeer, circ_id: u32) {
+    fn extend(&mut self, node: &dir::TorPeer) {
         println!("{:?}", node);
         let client_keypair = keys::Curve25519Keypair::new();
         let ntor_client_handshake = types::NtorClientHandshake::new(node, &client_keypair);
@@ -422,13 +425,13 @@ impl TorClient {
         );
         let mut extend2_bytes = Vec::new();
         extend2.write_to(&mut extend2_bytes).unwrap();
-        let bytes = self.encrypt_cell_bytes(circ_id, types::RelayCommand::Extend2, extend2_bytes);
+        let bytes = self.encrypt_cell_bytes(types::RelayCommand::Extend2, extend2_bytes);
         // EXTEND cells must always be sent in RELAY_EARLY cells(?)
-        self.send_cell_bytes(circ_id, types::Command::RelayEarly, bytes);
+        self.send_cell_bytes(types::Command::RelayEarly, bytes);
         let cell = self.read_cell();
         println!("{:?}", cell);
         let relay_cell = match cell.command {
-            types::Command::Relay => self.decrypt_cell_bytes(circ_id, &cell.payload),
+            types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
             _ => panic!("expected RELAY, got {:?}", cell.command),
         };
         println!("{}", relay_cell);
@@ -438,30 +441,15 @@ impl TorClient {
                 types::Created2Cell::read_new(&mut &relay_cell.data[..]).unwrap(),
             _ => panic!("expected EXTENDED2, got {:?}", relay_cell.relay_command),
         };
-        let circuit_keys = ntor_handshake(
+        if let Ok(circuit_keys) = ntor_handshake(
             &extended2,
             node.get_node_id(),
             node.get_ntor_key(),
             client_keypair.get_public_key_bytes(),
             client_keypair.get_secret_key_bytes(),
-        ).unwrap();
-    }
-
-    /// Generates a new, nonzero, random circuit id that hasn't been used before or panics.
-    fn get_new_circ_id(&mut self) -> u32 {
-        const RETRY_LIMIT: usize = 1024;
-        let mut csprng: OsRng = OsRng::new().unwrap();
-        let mut retries = RETRY_LIMIT;
-        while retries > 0 {
-            // We need to set the highest bit because we're initiating the connection.
-            let new_circ_id: u32 = csprng.gen::<u32>() | 0x8000_0000;
-            // HashSet.insert returns true if the value was not already present and false otherwise.
-            if self.used_circ_ids.insert(new_circ_id) {
-                return new_circ_id;
-            }
-            retries -= 1;
+        ) {
+            self.circuit_keys.push(circuit_keys);
         }
-        panic!("couldn't generate new circuit id. (maybe implement gc?)");
     }
 }
 
@@ -636,7 +624,7 @@ impl ResponderCerts {
     }
 }
 
-/// The certificates and keys needed by an initiator (`TorClient`) to perform a link authentication
+/// The certificates and keys needed by an initiator (`Circuit`) to perform a link authentication
 /// with a responder.
 struct InitiatorCerts {
     rsa_identity_key: keys::RsaPrivateKey,

@@ -516,7 +516,7 @@ pub struct RelayCell {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RelayCommand {
     Begin,
     Data,

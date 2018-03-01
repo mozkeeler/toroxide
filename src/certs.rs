@@ -158,16 +158,7 @@ impl Ed25519Cert {
             return false;
         }
         */
-        // Hmmm these as hard-coded lengths are sort-of a bummer. Maybe use an iterator?
-        if hash.len() != 32 {
-            return false;
-        }
-        for i in 0..32 {
-            if hash[i] != self.certified_key[i] {
-                return false;
-            }
-        }
-        true
+        hash == self.certified_key
     }
 
     pub fn get_extensions(&self) -> &[Ed25519CertExtension] {

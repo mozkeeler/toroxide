@@ -54,6 +54,8 @@ impl TorPeer {
             .lines()
             .filter(|&line| line.starts_with("r ") || line.starts_with("m "))
             .partition(|&line| line.starts_with("r "));
+        // We should probably also grab the "s" line, which appears to have a list of "flags" for
+        // each router. Of particular interest is e.g. "Exit" and "Guard".
         // TODO: check that routers.len() == m_hashes.len()
         for (router_line, m_hash_line) in routers.iter().zip(m_hashes) {
             microdescs.push(TorPeer::new(router_line, m_hash_line));

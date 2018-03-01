@@ -146,11 +146,14 @@ fn main() {
     circuit.read_netinfo();
     circuit.create_fast();
     circuit.extend(&peers[1]);
-    circuit.extend(&peers[2]);
+    circuit.extend(&peers[3]);
+    let stream_id = circuit.begin("127.0.0.1:3000");
+    circuit.send(stream_id, "hello\n".as_bytes());
 }
 
 impl Circuit {
     fn new(peer: &dir::TorPeer, circ_id: u32) -> Circuit {
+        println!("attempting to connect to {:?}", peer);
         Circuit {
             tls_connection: tls::TlsConnection::new(peer),
             circ_id: circ_id,
@@ -354,18 +357,22 @@ impl Circuit {
         self.circuit_keys.push(circuit_keys);
     }
 
+    // TODO: stream_id == 0 for control commands - how do we make this easy/automatic?
+    // (maybe tie it into the "get me a new stream id" function?)
     fn encrypt_cell_bytes(
         &mut self,
         relay_command: types::RelayCommand,
-        bytes: Vec<u8>,
+        in_bytes: &[u8],
+        stream_id: u16,
     ) -> Vec<u8> {
-        let mut bytes = bytes.clone();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(in_bytes);
         let mut first = true;
         for circuit_keys in self.circuit_keys.iter_mut().rev() {
             // TODO: this 0 may need to be something else in the future?
             // (for non-command cells)
             if first {
-                let mut relay_cell = types::RelayCell::new(relay_command.clone(), 0, bytes);
+                let mut relay_cell = types::RelayCell::new(relay_command.clone(), stream_id, bytes);
                 relay_cell.set_digest(&mut circuit_keys.forward_digest);
                 bytes = Vec::new();
                 relay_cell.write_to(&mut bytes).unwrap();
@@ -411,7 +418,7 @@ impl Circuit {
     }
 
     fn extend(&mut self, node: &dir::TorPeer) {
-        println!("{:?}", node);
+        println!("attempting to extend to {:?}", node);
         let client_keypair = keys::Curve25519Keypair::new();
         let ntor_client_handshake = types::NtorClientHandshake::new(node, &client_keypair);
         let mut ntor_client_handshake_bytes = Vec::new();
@@ -425,7 +432,7 @@ impl Circuit {
         );
         let mut extend2_bytes = Vec::new();
         extend2.write_to(&mut extend2_bytes).unwrap();
-        let bytes = self.encrypt_cell_bytes(types::RelayCommand::Extend2, extend2_bytes);
+        let bytes = self.encrypt_cell_bytes(types::RelayCommand::Extend2, &extend2_bytes, 0);
         // EXTEND cells must always be sent in RELAY_EARLY cells(?)
         self.send_cell_bytes(types::Command::RelayEarly, bytes);
         let cell = self.read_cell();
@@ -450,6 +457,44 @@ impl Circuit {
         ) {
             self.circuit_keys.push(circuit_keys);
         }
+    }
+
+    // returns what stream id we picked
+    fn begin(&mut self, addrport: &str) -> u16 {
+        let begin = types::BeginCell::new(addrport);
+        println!("{:?}", begin);
+        // Hmmm maybe I wouldn't have to do all this "make a cell then make a vec then write_to it"
+        // if I defined a trait...?
+        let mut begin_bytes: Vec<u8> = Vec::new();
+        begin.write_to(&mut begin_bytes).unwrap();
+        let stream_id = 1;
+        let bytes = self.encrypt_cell_bytes(types::RelayCommand::Begin, &begin_bytes, stream_id);
+        // The first 8 or so relay cells need to be RELAY_EARLY, so we need to keep track of this
+        // and switch over as appropriate.
+        println!("sending...");
+        self.send_cell_bytes(types::Command::RelayEarly, bytes);
+        println!("reading...");
+        let cell = self.read_cell();
+        println!("{:?}", cell);
+        let relay_cell = match cell.command {
+            types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
+            _ => panic!("expected RELAY, got {:?}", cell.command),
+        };
+        println!("{}", relay_cell);
+        // TODO: verify that this is a RELAY_CONNECTED cell...
+        stream_id
+    }
+
+    fn send(&mut self, stream_id: u16, data: &[u8]) {
+        let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, data, stream_id);
+        self.send_cell_bytes(types::Command::RelayEarly, bytes);
+        let cell = self.read_cell();
+        println!("{:?}", cell);
+        let relay_cell = match cell.command {
+            types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
+            _ => panic!("expected RELAY, got {:?}", cell.command),
+        };
+        println!("{}", relay_cell);
     }
 }
 

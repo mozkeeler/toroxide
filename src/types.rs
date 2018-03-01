@@ -972,3 +972,45 @@ impl Extend2Cell {
         writer.write_all(&self.h_data)
     }
 }
+
+// This is really just a placeholder.
+#[derive(Debug)]
+pub enum BeginFlags {
+    None,
+}
+
+impl BeginFlags {
+    fn as_u32(&self) -> u32 {
+        match self {
+            &BeginFlags::None => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BeginCell {
+    addrport: String,  // eh... make this less opaque in the future?
+    flags: BeginFlags, // TODO
+}
+
+impl BeginCell {
+    pub fn new(addrport: &str) -> BeginCell {
+        BeginCell {
+            addrport: addrport.to_string(),
+            flags: BeginFlags::None,
+        }
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_all(self.addrport.as_bytes())?;
+        writer.write_u8(0)?; // null-terminate the string
+        writer.write_u32::<NetworkEndian>(self.flags.as_u32())
+    }
+}
+
+// TODO...
+/*
+pub struct ConnectedCell {
+
+}
+*/

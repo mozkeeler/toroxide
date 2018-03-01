@@ -198,10 +198,6 @@ impl Ed25519Key {
         self.key.public.to_bytes()
     }
 
-    pub fn get_private_key_bytes(&self) -> [u8; 32] {
-        self.key.secret.to_bytes()
-    }
-
     pub fn sign_data(&self, data: &[u8]) -> [u8; 64] {
         self.key.sign::<Sha512>(data).to_bytes()
     }

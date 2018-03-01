@@ -745,18 +745,6 @@ pub struct NtorClientHandshake {
 }
 
 impl NtorClientHandshake {
-    pub fn read_new<R: Read>(reader: &mut R) -> Result<NtorClientHandshake> {
-        let mut handshake = NtorClientHandshake {
-            node_id: [0; 20],
-            key_id: [0; 32],
-            client_pk: [0; 32],
-        };
-        reader.read_exact(&mut handshake.node_id)?;
-        reader.read_exact(&mut handshake.key_id)?;
-        reader.read_exact(&mut handshake.client_pk)?;
-        Ok(handshake)
-    }
-
     pub fn new(peer: &dir::TorPeer, client_key: &keys::Curve25519Keypair) -> NtorClientHandshake {
         NtorClientHandshake {
             node_id: peer.get_node_id(),

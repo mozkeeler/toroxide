@@ -25,17 +25,14 @@ use constant_time_eq::constant_time_eq;
 use crypto::{aes, symmetriccipher};
 use curve25519_dalek::montgomery;
 use curve25519_dalek::scalar;
-use getopts::Options;
 use hmac::{Hmac, Mac};
 use num::PrimInt;
 use rand::{OsRng, Rand, Rng};
 use sha1::Sha1;
 use sha2::Sha256;
-use std::collections::{HashMap, HashSet};
-use std::env;
+use std::collections::HashSet;
 use std::hash::Hash;
 use std::io::prelude::*;
-use std::io;
 use std::ops::Mul;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -125,30 +122,7 @@ impl CircuitKeys {
     }
 }
 
-fn print_usage(program: &str, opts: Options) {
-    let brief = format!("Usage: {} [options]", program);
-    print!("{}", opts.usage(&brief));
-}
-
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let program = &args[0];
-    let mut opts = Options::new();
-    opts.optflag("d", "dump", "dump debug output from another Tor client");
-    opts.optflag("h", "help", "display this help message");
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(e) => panic!(e),
-    };
-    if matches.opt_present("h") {
-        print_usage(program, opts);
-        return;
-    }
-    if matches.opt_present("d") {
-        debug_dump_from_stdin();
-        return;
-    }
-
     let peers = dir::get_tor_peers();
     println!("{:?}", peers);
     let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
@@ -495,9 +469,7 @@ impl Circuit {
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Begin, &begin_bytes, stream_id);
         // The first 8 or so relay cells need to be RELAY_EARLY, so we need to keep track of this
         // and switch over as appropriate.
-        println!("sending...");
         self.send_cell_bytes(types::Command::RelayEarly, bytes);
-        println!("reading...");
         let cell = self.read_cell();
         println!("{:?}", cell);
         let relay_cell = match cell.command {
@@ -721,11 +693,8 @@ impl ResponderCerts {
 /// The certificates and keys needed by an initiator (`Circuit`) to perform a link authentication
 /// with a responder.
 struct InitiatorCerts {
-    rsa_identity_key: keys::RsaPrivateKey,
     rsa_identity_cert: certs::X509Cert,
-    ed25519_identity_key: keys::Ed25519Key,
     ed25519_identity_cert: certs::Ed25519Identity,
-    ed25519_signing_key: keys::Ed25519Key,
     ed25519_signing_cert: certs::Ed25519Cert,
     ed25519_authenticate_key: keys::Ed25519Key,
     ed25519_authenticate_cert: certs::Ed25519Cert,
@@ -733,12 +702,15 @@ struct InitiatorCerts {
 
 impl InitiatorCerts {
     fn new() -> InitiatorCerts {
+        // Apparently we don't need to keep this around for now.
         let rsa_identity_key = keys::RsaPrivateKey::new(1024).unwrap();
         let rsa_identity_cert = rsa_identity_key.generate_self_signed_cert().unwrap();
+        // Apparently we don't need to keep this around for now.
         let ed25519_identity_key = keys::Ed25519Key::new();
         let ed25519_identity_cert = rsa_identity_key
             .sign_ed25519_key(&ed25519_identity_key)
             .unwrap();
+        // Apparently we don't need to keep this around for now.
         let ed25519_signing_key = keys::Ed25519Key::new();
         let ed25519_signing_cert = ed25519_identity_key
             .sign_ed25519_key(&ed25519_signing_key, certs::Ed25519CertType::SigningKey);
@@ -748,11 +720,8 @@ impl InitiatorCerts {
             certs::Ed25519CertType::AuthenticationKey,
         );
         InitiatorCerts {
-            rsa_identity_key: rsa_identity_key,
             rsa_identity_cert: rsa_identity_cert,
-            ed25519_identity_key: ed25519_identity_key,
             ed25519_identity_cert: ed25519_identity_cert,
-            ed25519_signing_key: ed25519_signing_key,
             ed25519_signing_cert: ed25519_signing_cert,
             ed25519_authenticate_key: ed25519_authenticate_key,
             ed25519_authenticate_cert: ed25519_authenticate_cert,
@@ -866,180 +835,5 @@ fn ntor_handshake(
         Ok(compute_ntor_keys(&key_seed))
     } else {
         Err(())
-    }
-}
-
-fn debug_dump_from_stdin() {
-    let mut tor_parser = TorParser::new();
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line.unwrap();
-        if line.len() == 0 {
-            break;
-        }
-        tor_parser.handle_event(&line);
-    }
-}
-
-#[allow(non_snake_case)]
-struct NtorContext {
-    /// The SHA-1 hash of the router's RSA key
-    router_id: [u8; 20],
-    /// The router's ntor onion key "B" (public)
-    server_B: [u8; 32],
-    /// The ntor handshake public key "X"
-    client_X: [u8; 32],
-    /// The ntor handshake private key "x"
-    client_x: [u8; 32],
-}
-
-#[derive(Debug)]
-enum Direction {
-    Incoming,
-    Outgoing,
-}
-
-struct TorParser {
-    /// Map of circuit id to NtorContext
-    ntor_contexts: HashMap<u32, NtorContext>,
-    /// Created NtorContext that we don't know what circuit id it's for yet
-    pending_ntor_context: Option<NtorContext>,
-    /// Map of circuit id to CircuitKeys
-    circuit_keys: HashMap<u32, CircuitKeys>,
-}
-
-impl TorParser {
-    fn new() -> TorParser {
-        TorParser {
-            ntor_contexts: HashMap::new(),
-            pending_ntor_context: None,
-            circuit_keys: HashMap::new(),
-        }
-    }
-
-    fn handle_event(&mut self, event: &String) {
-        let parts: Vec<_> = event.split(":").collect();
-        match parts[0] {
-            "keygen" => self.decode_keygen(&parts[1..]),
-            "read" => self.decode_cell_hex(Direction::Incoming, parts[1]),
-            "write" => self.decode_cell_hex(Direction::Outgoing, parts[1]),
-            _ => println!("unknown operation {}", parts[0]),
-        }
-    }
-
-    fn decode_keygen(&mut self, keys_hex: &[&str]) {
-        self.pending_ntor_context = Some(NtorContext {
-            router_id: util::slice_to_20_byte_array(&hex::decode(keys_hex[0]).unwrap()),
-            server_B: util::slice_to_32_byte_array(&hex::decode(keys_hex[1]).unwrap()),
-            client_X: util::slice_to_32_byte_array(&hex::decode(keys_hex[2]).unwrap()),
-            client_x: util::slice_to_32_byte_array(&hex::decode(keys_hex[3]).unwrap()),
-        });
-    }
-
-    fn decode_cell_hex(&mut self, direction: Direction, cell_hex: &str) {
-        let mut bytes = &hex::decode(cell_hex).unwrap()[..];
-        self.decode_input(direction, &mut bytes);
-    }
-
-    fn decode_input<R: Read>(&mut self, direction: Direction, input: &mut R) {
-        let tor_cell = types::Cell::read_new(input).unwrap();
-        println!("{:?}", tor_cell);
-        match tor_cell.command {
-            types::Command::Relay => {
-                self.handle_encrypted_relay_cell(tor_cell.circ_id, direction, &tor_cell.payload);
-            }
-            types::Command::Netinfo => {
-                match types::NetinfoCell::read_new(&mut &tor_cell.payload[..]) {
-                    Ok(netinfo_cell) => {
-                        println!("{:?}", netinfo_cell);
-                    }
-                    Err(msg) => println!("{}", msg),
-                }
-            }
-            types::Command::Create2 => {
-                match types::Create2Cell::read_new(&mut &tor_cell.payload[..]) {
-                    Ok(create2_cell) => {
-                        println!("{:?}", create2_cell);
-                        // technically we should check create2_cell.h_type here
-                        let client_handshake = types::NtorClientHandshake::read_new(
-                            &mut create2_cell.get_h_data(),
-                        ).unwrap();
-                        println!("{:?}", client_handshake);
-                        if let Some(pending_ntor_context) = self.pending_ntor_context.take() {
-                            self.ntor_contexts
-                                .insert(tor_cell.circ_id, pending_ntor_context);
-                        }
-                    }
-                    Err(msg) => println!("{}", msg),
-                }
-            }
-            types::Command::Created2 => {
-                match types::Created2Cell::read_new(&mut &tor_cell.payload[..]) {
-                    Ok(created2_cell) => self.do_ntor_handshake(tor_cell.circ_id, &created2_cell),
-                    Err(msg) => println!("{}", msg),
-                }
-            }
-            types::Command::Certs => match types::CertsCell::read_new(&mut &tor_cell.payload[..]) {
-                Ok(certs_cell) => println!("{:?}", certs_cell),
-                Err(msg) => println!("{}", msg),
-            },
-            types::Command::AuthChallenge => {
-                match types::AuthChallengeCell::read_new(&mut &tor_cell.payload[..]) {
-                    Ok(auth_challenge_cell) => println!("{:?}", auth_challenge_cell),
-                    Err(msg) => println!("{}", msg),
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn do_ntor_handshake(&mut self, circ_id: u32, created2_cell: &types::Created2Cell) {
-        if let Some(ref ntor_context) = self.ntor_contexts.get(&circ_id) {
-            if let Ok(circuit_keys) = ntor_handshake(
-                created2_cell,
-                ntor_context.router_id,
-                ntor_context.server_B,
-                ntor_context.client_X,
-                ntor_context.client_x,
-            ) {
-                self.circuit_keys.insert(circ_id, circuit_keys);
-            }
-        }
-    }
-
-    fn handle_encrypted_relay_cell(
-        &mut self,
-        circ_id: u32,
-        direction: Direction,
-        encrypted_relay_cell: &[u8],
-    ) {
-        let bytes = if let Some(ref mut circuit_keys) = self.circuit_keys.get_mut(&circ_id) {
-            let mut decrypted_relay_cell: Vec<u8> = Vec::with_capacity(encrypted_relay_cell.len());
-            decrypted_relay_cell.resize(encrypted_relay_cell.len(), 0);
-            // So we have to have some way to roll back things that weren't actually for us (or
-            // attacks that would attempt to modify our counter...)
-            // It seems the canonical implementation just kills the connection if this ever happens.
-            let aes_context = match direction {
-                Direction::Incoming => &mut circuit_keys.backward_key,
-                Direction::Outgoing => &mut circuit_keys.forward_key,
-            };
-            aes_context
-                .aes
-                .process(encrypted_relay_cell, &mut decrypted_relay_cell);
-            decrypted_relay_cell
-        } else {
-            return;
-        };
-        match types::RelayCell::read_new(&mut &bytes[..]) {
-            Ok(relay_cell) => self.handle_relay_cell(circ_id, direction, relay_cell),
-            Err(err) => println!("{}", err),
-        };
-    }
-
-    fn handle_relay_cell(&self, circ_id: u32, direction: Direction, relay_cell: types::RelayCell) {
-        println!(
-            "handle_relay_cell({}, {:?}, {}",
-            circ_id, direction, relay_cell
-        );
     }
 }

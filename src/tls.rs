@@ -1,8 +1,8 @@
 use openssl::hash::MessageDigest;
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream, SslVerifyMode};
 use sha2::{Digest, Sha256};
-use std::net::TcpStream;
 use std::io::{Read, Result, Write};
+use std::net::TcpStream;
 
 use dir::TorPeer;
 

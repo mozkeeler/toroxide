@@ -66,7 +66,7 @@ impl TlsConnection {
             .export_keying_material(
                 &mut buf,
                 "EXPORTER FOR TOR TLS CLIENT BINDING AUTH0003",
-                context_key,
+                Some(context_key),
             )
             .unwrap();
         buf

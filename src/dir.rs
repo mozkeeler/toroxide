@@ -29,7 +29,10 @@ fn do_get(uri: &str) -> String {
 }
 
 pub fn get_tor_peers(hostport: &str) -> Vec<TorPeer> {
-    let uri = format!("http://{}/tor/status-vote/current/consensus-microdesc/", hostport);
+    let uri = format!(
+        "http://{}/tor/status-vote/current/consensus-microdesc/",
+        hostport
+    );
     TorPeer::parse_all(hostport, do_get(&uri))
 }
 

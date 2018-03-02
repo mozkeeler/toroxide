@@ -1,6 +1,6 @@
 toroxide
 -----
-`toroxide` is an experimental, proof-of-concept implementation of the client side of the Tor protocol in Rust. You should not rely on it to protect your anonymity (in fact, it can't even connect to the real Tor network at the moment).
+`toroxide` is an experimental, proof-of-concept implementation of the client side of the Tor protocol in Rust. You should not rely on it to protect your anonymity (in fact, it probably can't even connect to the real Tor network at the moment).
 
 Building and Running
 -----

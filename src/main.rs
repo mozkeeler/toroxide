@@ -148,26 +148,29 @@ fn main() {
     circuit.create_fast();
     circuit.extend(&peers[1]);
     circuit.extend(&peers[3]);
-    let stream_id = circuit.begin("127.0.0.1:3000");
-    circuit.send(stream_id, "hello\n".as_bytes());
-    let response = circuit.recv();
-    print!("{}", String::from_utf8(response).unwrap());
-    circuit.end(stream_id);
+    let stream_id = circuit.begin("example.com:80");
+    let request = r#"GET / HTTP/1.1
+Host: example.com
+User-Agent: toroxide/0.1.0
+Accept: text/html
+Accept-Language: en-US,en;q=0.5
+Connection: close
 
-    let stream_id = circuit.begin("127.0.0.1:3000");
-    circuit.send(stream_id, "world\n".as_bytes());
-    let response = circuit.recv();
+"#;
+    circuit.send(stream_id, request.as_bytes());
+    let response = circuit.recv_to_end();
     print!("{}", String::from_utf8(response).unwrap());
-    circuit.end(stream_id);
 
-    let stream_id = circuit.begin("127.0.0.1:3000");
-    circuit.send(
-        stream_id,
-        "this is a bit longer of a string but still not that long\n".as_bytes(),
-    );
-    let response = circuit.recv();
+    let stream_id = circuit.begin("ip.seeip.org:80");
+    let request = r#"GET / HTTP/1.1
+Host: ip.seeip.org
+User-Agent: toroxide/0.1.0
+Connection: close
+
+"#;
+    circuit.send(stream_id, request.as_bytes());
+    let response = circuit.recv_to_end();
     print!("{}", String::from_utf8(response).unwrap());
-    circuit.end(stream_id);
 }
 
 impl Circuit {
@@ -512,36 +515,23 @@ impl Circuit {
         self.send_cell_bytes(bytes);
     }
 
-    // stream_id?
-    fn recv(&mut self) -> Vec<u8> {
-        let cell = self.read_cell();
-        println!("{:?}", cell);
-        let relay_cell = match cell.command {
-            types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
-            _ => panic!("expected RELAY, got {:?}", cell.command),
-        };
-        println!("{}", relay_cell);
-        match relay_cell.relay_command {
-            types::RelayCommand::Data => relay_cell.data,
-            _ => panic!("expected DATA, got {:?}", relay_cell.relay_command),
+    fn recv_to_end(&mut self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        loop {
+            let cell = self.read_cell();
+            println!("{:?}", cell);
+            let relay_cell = match cell.command {
+                types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
+                _ => panic!("expected RELAY, got {:?}", cell.command),
+            };
+            println!("{}", relay_cell);
+            match relay_cell.relay_command {
+                types::RelayCommand::Data => buf.extend(relay_cell.data),
+                types::RelayCommand::End => break,
+                _ => panic!("expected DATA or END, got {:?}", relay_cell.relay_command),
+            }
         }
-    }
-
-    fn end(&mut self, stream_id: u16) {
-        let data = [6]; // REASON_DONE
-        let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, &data, stream_id);
-        self.send_cell_bytes(bytes);
-        let cell = self.read_cell();
-        println!("{:?}", cell);
-        let relay_cell = match cell.command {
-            types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
-            _ => panic!("expected RELAY, got {:?}", cell.command),
-        };
-        println!("{}", relay_cell);
-        match relay_cell.relay_command {
-            types::RelayCommand::End => println!("received RELAY_END: {}", relay_cell.data[0]),
-            _ => panic!("expected RELAY_END, got {:?}", relay_cell.relay_command),
-        }
+        buf
     }
 }
 

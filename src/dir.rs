@@ -28,9 +28,9 @@ fn do_get(uri: &str) -> String {
     String::from_utf8(data).unwrap()
 }
 
-pub fn get_tor_peers() -> Vec<TorPeer> {
-    let uri = "http://localhost:7000/tor/status-vote/current/consensus-microdesc/";
-    TorPeer::parse_all(do_get(uri))
+pub fn get_tor_peers(hostport: &str) -> Vec<TorPeer> {
+    let uri = format!("http://{}/tor/status-vote/current/consensus-microdesc/", hostport);
+    TorPeer::parse_all(hostport, do_get(&uri))
 }
 
 #[derive(Debug)]
@@ -48,7 +48,7 @@ pub struct TorPeer {
 }
 
 impl TorPeer {
-    fn parse_all(response_string: String) -> Vec<TorPeer> {
+    fn parse_all(hostport: &str, response_string: String) -> Vec<TorPeer> {
         let mut microdescs: Vec<TorPeer> = Vec::new();
         let (routers, m_hashes): (Vec<&str>, Vec<&str>) = response_string
             .lines()
@@ -58,14 +58,15 @@ impl TorPeer {
         // each router. Of particular interest is e.g. "Exit" and "Guard".
         // TODO: check that routers.len() == m_hashes.len()
         for (router_line, m_hash_line) in routers.iter().zip(m_hashes) {
-            microdescs.push(TorPeer::new(router_line, m_hash_line));
+            microdescs.push(TorPeer::new(hostport, router_line, m_hash_line));
         }
         microdescs
     }
 
-    fn new(router_line: &str, m_hash_line: &str) -> TorPeer {
+    fn new(hostport: &str, router_line: &str, m_hash_line: &str) -> TorPeer {
         let keys_uri = format!(
-            "http://localhost:7000/tor/micro/d/{}",
+            "http://{}/tor/micro/d/{}",
+            hostport,
             m_hash_line.split(" ").nth(1).unwrap()
         );
         let keys_data = do_get(&keys_uri);

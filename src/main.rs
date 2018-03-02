@@ -31,6 +31,7 @@ use rand::{OsRng, Rand, Rng};
 use sha1::Sha1;
 use sha2::Sha256;
 use std::collections::HashSet;
+use std::env;
 use std::hash::Hash;
 use std::io::prelude::*;
 use std::ops::Mul;
@@ -124,8 +125,17 @@ impl CircuitKeys {
     }
 }
 
+fn usage(program: &str) {
+    println!("Usage: {} <directory server>:<port>", program);
+}
+
 fn main() {
-    let peers = dir::get_tor_peers();
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        usage(&args[0]);
+        return;
+    }
+    let peers = dir::get_tor_peers(&args[1]);
     println!("{:?}", peers);
     let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
     let circ_id = circ_id_tracker.get_new_id();

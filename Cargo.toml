@@ -1,5 +1,5 @@
 [package]
-name = "tor-parse"
+name = "toroxide"
 version = "0.1.0"
 authors = ["D Keeler <mozkeeler@gmail.com>"]
 license = "MPL-2.0"

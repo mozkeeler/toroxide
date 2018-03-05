@@ -135,19 +135,30 @@ fn main() {
         usage(&args[0]);
         return;
     }
-    let peers = dir::get_tor_peers(&args[1]);
-    println!("{:?}", peers);
+    let mut peers = dir::get_tor_peers(&args[1]);
     let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
     let circ_id = circ_id_tracker.get_new_id();
-    let mut circuit = Circuit::new(&peers[0], circ_id);
+    let guard_node = match peers.get_guard_node() {
+        Some(node) => node,
+        None => panic!("couldn't find guard node?"),
+    };
+    let mut circuit = Circuit::new(&guard_node, circ_id);
     circuit.negotiate_versions();
-    circuit.read_certs(&peers[0].get_ed25519_id_key());
+    circuit.read_certs(&guard_node.get_ed25519_id_key());
     circuit.read_auth_challenge();
     circuit.send_certs_and_authenticate_cells();
     circuit.read_netinfo();
     circuit.create_fast();
-    circuit.extend(&peers[1]);
-    circuit.extend(&peers[3]);
+    let interior_node = match peers.get_interior_node() {
+        Some(node) => node,
+        None => panic!("couldn't find interior node?"),
+    };
+    circuit.extend(&interior_node);
+    let exit_node = match peers.get_exit_node() {
+        Some(node) => node,
+        None => panic!("couldn't find exit node?"),
+    };
+    circuit.extend(&exit_node);
     let stream_id = circuit.begin("example.com:80");
     let request = r#"GET / HTTP/1.1
 Host: example.com

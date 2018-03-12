@@ -1,4 +1,5 @@
 use curl::easy::Easy;
+use sha2::{Digest, Sha256};
 use std::iter::FromIterator;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -61,7 +62,10 @@ impl TorPeerList {
             None => return None,
         };
         if let Some(taken) = self.peers.take(&node) {
-            Some(taken.to_tor_peer(&self.hostport))
+            match taken.to_tor_peer(&self.hostport) {
+                Ok(peer) => Some(peer),
+                Err(()) => None, // retry in this case?
+            }
         } else {
             None // this shouldn't happen but still
         }
@@ -73,7 +77,10 @@ impl TorPeerList {
             None => return None,
         };
         if let Some(taken) = self.peers.take(&node) {
-            Some(taken.to_tor_peer(&self.hostport))
+            match taken.to_tor_peer(&self.hostport) {
+                Ok(peer) => Some(peer),
+                Err(()) => None, // retry in this case?
+            }
         } else {
             None // this shouldn't happen but still
         }
@@ -88,7 +95,10 @@ impl TorPeerList {
             None => return None,
         };
         if let Some(taken) = self.peers.take(&node) {
-            Some(taken.to_tor_peer(&self.hostport))
+            match taken.to_tor_peer(&self.hostport) {
+                Ok(peer) => Some(peer),
+                Err(()) => None, // retry in this case?
+            }
         } else {
             None // this shouldn't happen but still
         }
@@ -156,9 +166,18 @@ impl PreTorPeer {
         }
     }
 
-    fn to_tor_peer(&self, hostport: &str) -> TorPeer {
+    // TODO: make an error type for this Result? (it doesn't leave this module, but still...)
+    fn to_tor_peer(&self, hostport: &str) -> Result<TorPeer, ()> {
         let keys_uri = format!("http://{}/tor/micro/d/{}", hostport, self.mdesc_hash);
         let keys_data = do_get(&keys_uri);
+        // This is how we authenticate the returned data. The microdescriptor hash was part of the
+        // signed consensus document, so if the hash of the data we get back matches that hash, then
+        // the data is what went into the consensus, in theory.
+        let hashed = Sha256::digest_str(&keys_data);
+        if base64::encode_config(&hashed, base64::STANDARD_NO_PAD) != self.mdesc_hash {
+            return Err(());
+        }
+
         let mut ntor_onion_key: [u8; 32] = [0; 32];
         let mut ed25519_id_key: [u8; 32] = [0; 32];
         let mut in_rsa_key = false;
@@ -184,14 +203,14 @@ impl PreTorPeer {
                 ).unwrap());
             }
         }
-        TorPeer {
+        Ok(TorPeer {
             ip_address: self.ip_address,
             port: self.port,
             rsa_public_key: base64::decode(&rsa_public_key_base64).unwrap(),
             ntor_onion_key: ntor_onion_key,
             ed25519_id_key: ed25519_id_key,
             node_id: self.node_id,
-        }
+        })
     }
 }
 

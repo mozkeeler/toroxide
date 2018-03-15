@@ -11,6 +11,10 @@ use base64;
 
 use util;
 
+pub trait Fetch {
+    fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()>;
+}
+
 // eventually we'll want to know *where* to get the peers from
 // also async? also we're not even going to do this in the long run (we'll need some sort of
 // get-this-using-your-own-http-client API or whatever)
@@ -28,6 +32,17 @@ fn do_get(uri: &str) -> Result<Vec<u8>, Error> {
         transfer.perform()?;
     }
     Ok(data)
+}
+
+struct EasyFetcher {}
+
+impl Fetch for EasyFetcher {
+    fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()> {
+        match do_get(uri) {
+            Ok(bytes) => Ok(bytes),
+            Err(_) => Err(()),
+        }
+    }
 }
 
 pub fn get_tor_peers(hostport: &str) -> Result<TorPeerList, ()> {
@@ -69,7 +84,7 @@ impl TorPeerList {
             None => return None,
         };
         if let Some(taken) = self.peers.take(&node) {
-            match taken.to_tor_peer(&self.hostport) {
+            match taken.to_tor_peer(&self.hostport, &mut EasyFetcher {}) {
                 Ok(peer) => Some(peer),
                 Err(()) => None, // retry in this case?
             }
@@ -78,13 +93,13 @@ impl TorPeerList {
         }
     }
 
-    pub fn get_interior_node(&mut self) -> Option<TorPeer> {
+    pub fn get_interior_node<F: Fetch>(&mut self, fetcher: &mut F) -> Option<TorPeer> {
         let node = match self.peers.iter().find(|node| node.is_usable) {
             Some(node) => node.clone(),
             None => return None,
         };
         if let Some(taken) = self.peers.take(&node) {
-            match taken.to_tor_peer(&self.hostport) {
+            match taken.to_tor_peer(&self.hostport, fetcher) {
                 Ok(peer) => Some(peer),
                 Err(()) => None, // retry in this case?
             }
@@ -93,7 +108,7 @@ impl TorPeerList {
         }
     }
 
-    pub fn get_exit_node(&mut self) -> Option<TorPeer> {
+    pub fn get_exit_node<F: Fetch>(&mut self, fetcher: &mut F) -> Option<TorPeer> {
         let node = match self.peers
             .iter()
             .find(|node| node.is_usable && node.is_exit)
@@ -102,7 +117,7 @@ impl TorPeerList {
             None => return None,
         };
         if let Some(taken) = self.peers.take(&node) {
-            match taken.to_tor_peer(&self.hostport) {
+            match taken.to_tor_peer(&self.hostport, fetcher) {
                 Ok(peer) => Some(peer),
                 Err(()) => None, // retry in this case?
             }
@@ -175,9 +190,9 @@ impl PreTorPeer {
     }
 
     // TODO: make an error type for this Result? (it doesn't leave this module, but still...)
-    fn to_tor_peer(&self, hostport: &str) -> Result<TorPeer, ()> {
+    fn to_tor_peer<F: Fetch>(&self, hostport: &str, fetcher: &mut F) -> Result<TorPeer, ()> {
         let keys_uri = format!("http://{}/tor/micro/d/{}", hostport, self.mdesc_hash);
-        let keys_data = match do_get(&keys_uri) {
+        let keys_data = match fetcher.fetch(&keys_uri) {
             Ok(keys_data) => keys_data,
             Err(_) => return Err(()),
         };
@@ -185,7 +200,8 @@ impl PreTorPeer {
         // signed consensus document, so if the hash of the data we get back matches that hash, then
         // the data is what went into the consensus, in theory.
         let hashed = Sha256::digest(&keys_data);
-        if base64::encode_config(&hashed, base64::STANDARD_NO_PAD) != self.mdesc_hash {
+        let hashed_encoded = base64::encode_config(&hashed, base64::STANDARD_NO_PAD);
+        if hashed_encoded != self.mdesc_hash {
             return Err(());
         }
 

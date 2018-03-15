@@ -124,6 +124,38 @@ impl CircuitKeys {
     }
 }
 
+/// Used while setting up a curcuit to fetch the directory information of the next hop.
+struct CircuitDirectoryFetcher<'a> {
+    circuit: &'a mut Circuit,
+}
+
+impl<'a> dir::Fetch for CircuitDirectoryFetcher<'a> {
+    fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()> {
+        let stream_id = self.circuit.begin_dir();
+        // uri will be of the form 'http://<host:port>/some/path/.../' - we just want the
+        // '/some/path/.../' part.
+        let path_parts = uri.split('/').skip(3);
+        let mut path = String::new();
+        for part in path_parts {
+            path.push('/');
+            path.push_str(part);
+        }
+        let request = format!("GET {} HTTP/1.0\r\n\r\n", path);
+        self.circuit.send(stream_id, request.as_bytes());
+        // This will be an HTTP response like "HTTP/1.0 200 OK..." - we just want the body.
+        let response = self.circuit.recv_to_end();
+        let as_string = match String::from_utf8(response) {
+            Ok(as_string) => as_string,
+            Err(_) => return Err(()),
+        };
+        let index = match as_string.find("\r\n\r\n") {
+            Some(index) => index,
+            None => return Err(()),
+        };
+        Ok(as_string[index + 4..].as_bytes().to_owned())
+    }
+}
+
 fn usage(program: &str) {
     println!("Usage: {} <directory server>:<port>", program);
 }
@@ -148,14 +180,24 @@ fn main() {
     circuit.send_certs_and_authenticate_cells();
     circuit.read_netinfo();
     circuit.create_fast();
-    let interior_node = match peers.get_interior_node() {
-        Some(node) => node,
-        None => panic!("couldn't find interior node?"),
+    let interior_node = {
+        let mut fetcher = CircuitDirectoryFetcher {
+            circuit: &mut circuit,
+        };
+        match peers.get_interior_node(&mut fetcher) {
+            Some(node) => node,
+            None => panic!("couldn't find interior node?"),
+        }
     };
     circuit.extend(&interior_node);
-    let exit_node = match peers.get_exit_node() {
-        Some(node) => node,
-        None => panic!("couldn't find exit node?"),
+    let exit_node = {
+        let mut fetcher = CircuitDirectoryFetcher {
+            circuit: &mut circuit,
+        };
+        match peers.get_exit_node(&mut fetcher) {
+            Some(node) => node,
+            None => panic!("couldn't find exit node?"),
+        }
     };
     circuit.extend(&exit_node);
     let stream_id = circuit.begin("example.com:80");
@@ -495,15 +537,11 @@ impl Circuit {
     }
 
     // returns what stream id we picked
-    fn begin(&mut self, addrport: &str) -> u16 {
-        let begin = types::BeginCell::new(addrport);
-        println!("{:?}", begin);
-        // Hmmm maybe I wouldn't have to do all this "make a cell then make a vec then write_to it"
-        // if I defined a trait...?
-        let mut begin_bytes: Vec<u8> = Vec::new();
-        begin.write_to(&mut begin_bytes).unwrap();
+    /// begin_command must be types::RelayCommand::RELAY_BEGIN or
+    /// types::RelayCommand::RELAY_BEGIN_DIR for this to be useful
+    fn begin_common(&mut self, begin_command: types::RelayCommand, begin_bytes: &[u8]) -> u16 {
         let stream_id = self.used_stream_ids.get_new_id();
-        let bytes = self.encrypt_cell_bytes(types::RelayCommand::Begin, &begin_bytes, stream_id);
+        let bytes = self.encrypt_cell_bytes(begin_command, begin_bytes, stream_id);
         self.send_cell_bytes(bytes);
         let cell = self.read_cell();
         println!("{:?}", cell);
@@ -514,6 +552,22 @@ impl Circuit {
         println!("{}", relay_cell);
         // TODO: verify that this is a RELAY_CONNECTED cell...
         stream_id
+    }
+    fn begin(&mut self, addrport: &str) -> u16 {
+        let begin = types::BeginCell::new(addrport);
+        println!("{:?}", begin);
+        // Hmmm maybe I wouldn't have to do all this "make a cell then make a vec then write_to it"
+        // if I defined a trait...?
+        let mut begin_bytes: Vec<u8> = Vec::new();
+        begin.write_to(&mut begin_bytes).unwrap();
+        self.begin_common(types::RelayCommand::Begin, &begin_bytes)
+    }
+
+    fn begin_dir(&mut self) -> u16 {
+        let begin = types::BeginDirCell::new();
+        let mut begin_bytes: Vec<u8> = Vec::new();
+        begin.write_to(&mut begin_bytes).unwrap();
+        self.begin_common(types::RelayCommand::BeginDir, &begin_bytes)
     }
 
     fn send(&mut self, stream_id: u16, data: &[u8]) {
@@ -532,7 +586,7 @@ impl Circuit {
             };
             println!("{}", relay_cell);
             match relay_cell.relay_command {
-                types::RelayCommand::Data => buf.extend(relay_cell.data),
+                types::RelayCommand::Data => buf.extend(relay_cell.get_data()),
                 types::RelayCommand::End => break,
                 _ => panic!("expected DATA or END, got {:?}", relay_cell.relay_command),
             }

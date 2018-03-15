@@ -651,6 +651,10 @@ impl RelayCell {
         }
         Ok(())
     }
+
+    pub fn get_data(&self) -> &[u8] {
+        &self.data[..self.length as usize]
+    }
 }
 
 impl fmt::Display for RelayCell {
@@ -921,6 +925,20 @@ impl BeginCell {
         writer.write_all(self.addrport.as_bytes())?;
         writer.write_u8(0)?; // null-terminate the string
         writer.write_u32::<NetworkEndian>(self.flags.as_u32())
+    }
+}
+
+// Maybe just simplify this? (although maybe with a trait it'll be kinda moot)
+#[derive(Debug)]
+pub struct BeginDirCell {}
+
+impl BeginDirCell {
+    pub fn new() -> BeginDirCell {
+        BeginDirCell {}
+    }
+
+    pub fn write_to<W: Write>(&self, _writer: &mut W) -> Result<()> {
+        Ok(())
     }
 }
 

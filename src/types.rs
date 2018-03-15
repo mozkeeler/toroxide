@@ -668,76 +668,6 @@ impl fmt::Display for RelayCell {
 }
 
 #[derive(Debug)]
-pub enum ClientHandshakeType {
-    Tap,
-    Reserved,
-    Ntor,
-    Unknown(u16),
-}
-
-impl ClientHandshakeType {
-    pub fn from_u16(h_type: u16) -> ClientHandshakeType {
-        match h_type {
-            0 => ClientHandshakeType::Tap,
-            1 => ClientHandshakeType::Reserved,
-            2 => ClientHandshakeType::Ntor,
-            _ => ClientHandshakeType::Unknown(h_type),
-        }
-    }
-
-    pub fn as_u16(&self) -> u16 {
-        match self {
-            &ClientHandshakeType::Tap => 0,
-            &ClientHandshakeType::Reserved => 1,
-            &ClientHandshakeType::Ntor => 2,
-            &ClientHandshakeType::Unknown(value) => value,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Create2Cell {
-    h_type: ClientHandshakeType,
-    h_len: u16,
-    h_data: Vec<u8>,
-}
-
-impl Create2Cell {
-    pub fn read_new<R: Read>(reader: &mut R) -> Result<Create2Cell> {
-        let h_type_raw = reader.read_u16::<NetworkEndian>()?;
-        let h_len = reader.read_u16::<NetworkEndian>()?;
-        let mut h_data: Vec<u8> = Vec::with_capacity(h_len as usize);
-        h_data.resize(h_len as usize, 0);
-        reader.read_exact(&mut h_data)?;
-        Ok(Create2Cell {
-            h_type: ClientHandshakeType::from_u16(h_type_raw),
-            h_len: h_len,
-            h_data: h_data,
-        })
-    }
-
-    pub fn new(h_type: ClientHandshakeType, h_data: Vec<u8>) -> Create2Cell {
-        assert!(h_data.len() < 65536);
-        Create2Cell {
-            h_type: h_type,
-            h_len: h_data.len() as u16,
-            h_data: h_data,
-        }
-    }
-
-    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
-        writer.write_u16::<NetworkEndian>(self.h_type.as_u16())?;
-        assert!(self.h_data.len() < 65536);
-        writer.write_u16::<NetworkEndian>(self.h_data.len() as u16)?;
-        writer.write_all(&self.h_data)
-    }
-
-    pub fn get_h_data(&self) -> &[u8] {
-        &self.h_data
-    }
-}
-
-#[derive(Debug)]
 pub struct NtorClientHandshake {
     node_id: [u8; 20],
     key_id: [u8; 32],
@@ -920,19 +850,16 @@ pub struct Extend2Cell {
     ipv4: [u8; 4],
     /// (port for the above)
     port: u16,
-    /// In reality, always ClientHandshakeType::Ntor
-    h_type: ClientHandshakeType,
     h_data: Vec<u8>,
 }
 
 impl Extend2Cell {
-    pub fn new(node: &dir::TorPeer, h_type: ClientHandshakeType, h_data: Vec<u8>) -> Extend2Cell {
+    pub fn new(node: &dir::TorPeer, h_data: Vec<u8>) -> Extend2Cell {
         Extend2Cell {
             ed25519_identity: node.get_ed25519_id_key(),
             rsa_id: node.get_node_id(),
             ipv4: node.get_ipv4_as_bytes(),
             port: node.get_port(),
-            h_type: h_type,
             h_data: h_data,
         }
     }
@@ -954,7 +881,8 @@ impl Extend2Cell {
         writer.write_u8(32)?; // Ed25519 public key is 32 bytes
         writer.write_all(&self.ed25519_identity)?;
 
-        writer.write_u16::<NetworkEndian>(self.h_type.as_u16())?;
+        // Only Ntor (handshake type 2) is implemented.
+        writer.write_u16::<NetworkEndian>(2 as u16)?;
         assert!(self.h_data.len() < 65536);
         writer.write_u16::<NetworkEndian>(self.h_data.len() as u16)?;
         writer.write_all(&self.h_data)

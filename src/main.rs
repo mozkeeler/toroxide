@@ -111,7 +111,6 @@ struct CircuitKeys {
     backward_digest: Sha1,
     forward_key: AesContext,
     backward_key: AesContext,
-    // KH in hidden service protocol? (doesn't appear to be implemented...?)
 }
 
 impl CircuitKeys {
@@ -466,11 +465,7 @@ impl Circuit {
         ntor_client_handshake
             .write_to(&mut ntor_client_handshake_bytes)
             .unwrap();
-        let extend2 = types::Extend2Cell::new(
-            node,
-            types::ClientHandshakeType::Ntor,
-            ntor_client_handshake_bytes,
-        );
+        let extend2 = types::Extend2Cell::new(node, ntor_client_handshake_bytes);
         let mut extend2_bytes = Vec::new();
         extend2.write_to(&mut extend2_bytes).unwrap();
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Extend2, &extend2_bytes, 0);

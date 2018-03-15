@@ -11,6 +11,7 @@ pub fn slice_to_32_byte_array(bytes: &[u8]) -> [u8; 32] {
     fixed_size
 }
 
+#[allow(dead_code)]
 pub fn hexdump(bytes: &[u8]) {
     for b in bytes {
         print!("{:02x}", b);

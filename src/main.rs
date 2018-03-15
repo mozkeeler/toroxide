@@ -135,7 +135,7 @@ fn main() {
         usage(&args[0]);
         return;
     }
-    let mut peers = dir::get_tor_peers(&args[1]);
+    let mut peers = dir::get_tor_peers(&args[1]).unwrap();
     let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
     let circ_id = circ_id_tracker.get_new_id();
     let guard_node = match peers.get_guard_node() {

@@ -1,4 +1,5 @@
 use curl::easy::Easy;
+use curl::Error;
 use sha2::{Digest, Sha256};
 use std::iter::FromIterator;
 use std::collections::HashSet;
@@ -13,30 +14,36 @@ use util;
 // eventually we'll want to know *where* to get the peers from
 // also async? also we're not even going to do this in the long run (we'll need some sort of
 // get-this-using-your-own-http-client API or whatever)
-fn do_get(uri: &str) -> String {
+fn do_get(uri: &str) -> Result<Vec<u8>, Error> {
     let mut data = Vec::new();
     let mut handle = Easy::new();
-    handle.url(uri).unwrap();
+    handle.url(uri)?;
     {
         // Ok this is for sure poor API design, though.
         let mut transfer = handle.transfer();
-        transfer
-            .write_function(|new_data| {
-                data.extend_from_slice(new_data);
-                Ok(new_data.len())
-            })
-            .unwrap();
-        transfer.perform().unwrap();
+        transfer.write_function(|new_data| {
+            data.extend_from_slice(new_data);
+            Ok(new_data.len())
+        })?;
+        transfer.perform()?;
     }
-    String::from_utf8(data).unwrap()
+    Ok(data)
 }
 
-pub fn get_tor_peers(hostport: &str) -> TorPeerList {
+pub fn get_tor_peers(hostport: &str) -> Result<TorPeerList, ()> {
     let uri = format!(
         "http://{}/tor/status-vote/current/consensus-microdesc/",
         hostport
     );
-    TorPeerList::new(hostport, PreTorPeer::parse_all(do_get(&uri)))
+    let data = match do_get(&uri) {
+        Ok(data) => data,
+        Err(_) => return Err(()),
+    };
+    let as_string = match String::from_utf8(data) {
+        Ok(as_string) => as_string,
+        Err(_) => return Err(()),
+    };
+    Ok(TorPeerList::new(hostport, PreTorPeer::parse_all(as_string)))
 }
 
 #[derive(Debug)]
@@ -121,6 +128,7 @@ struct PreTorPeer {
 }
 
 impl PreTorPeer {
+    // TODO: validate the signatures on the given data
     fn parse_all(response_string: String) -> Vec<PreTorPeer> {
         let mut microdescs = Vec::new();
         let mut router_line: Option<&str> = None;
@@ -169,20 +177,28 @@ impl PreTorPeer {
     // TODO: make an error type for this Result? (it doesn't leave this module, but still...)
     fn to_tor_peer(&self, hostport: &str) -> Result<TorPeer, ()> {
         let keys_uri = format!("http://{}/tor/micro/d/{}", hostport, self.mdesc_hash);
-        let keys_data = do_get(&keys_uri);
+        let keys_data = match do_get(&keys_uri) {
+            Ok(keys_data) => keys_data,
+            Err(_) => return Err(()),
+        };
         // This is how we authenticate the returned data. The microdescriptor hash was part of the
         // signed consensus document, so if the hash of the data we get back matches that hash, then
         // the data is what went into the consensus, in theory.
-        let hashed = Sha256::digest_str(&keys_data);
+        let hashed = Sha256::digest(&keys_data);
         if base64::encode_config(&hashed, base64::STANDARD_NO_PAD) != self.mdesc_hash {
             return Err(());
         }
+
+        let keys_string = match String::from_utf8(keys_data) {
+            Ok(keys_string) => keys_string,
+            Err(_) => return Err(()),
+        };
 
         let mut ntor_onion_key: [u8; 32] = [0; 32];
         let mut ed25519_id_key: [u8; 32] = [0; 32];
         let mut in_rsa_key = false;
         let mut rsa_public_key_base64 = String::new();
-        for line in keys_data.lines() {
+        for line in keys_string.lines() {
             if line == "-----END RSA PUBLIC KEY-----" {
                 in_rsa_key = false;
             }

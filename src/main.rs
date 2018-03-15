@@ -21,8 +21,10 @@ mod tls;
 mod types;
 mod util;
 
+use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use constant_time_eq::constant_time_eq;
-use crypto::{aes, symmetriccipher};
+use crypto::{aessafe, blockmodes};
+use crypto::symmetriccipher::SynchronousStreamCipher;
 use curve25519_dalek::montgomery;
 use curve25519_dalek::scalar;
 use hmac::{Hmac, Mac};
@@ -34,7 +36,9 @@ use std::collections::HashSet;
 use std::env;
 use std::hash::Hash;
 use std::io::prelude::*;
+use std::net::TcpListener;
 use std::ops::Mul;
+use std::thread::spawn;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Circuit {
@@ -93,15 +97,17 @@ where
 }
 
 struct AesContext {
-    aes: Box<symmetriccipher::SynchronousStreamCipher + 'static>,
+    aes: blockmodes::CtrMode<aessafe::AesSafe128Encryptor>,
 }
 
 impl AesContext {
     fn new(key: &[u8]) -> AesContext {
-        let iv: [u8; 16] = [0; 16];
+        let mut iv: Vec<u8> = Vec::with_capacity(16);
+        iv.resize(16, 0);
         let key: [u8; 16] = slice_to_16_byte_array(key);
+        let aes_dec = aessafe::AesSafe128Encryptor::new(&key);
         AesContext {
-            aes: aes::ctr(aes::KeySize::KeySize128, &key, &iv),
+            aes: blockmodes::CtrMode::new(aes_dec, iv),
         }
     }
 }
@@ -168,6 +174,100 @@ fn main() {
     }
     let mut peers = dir::get_tor_peers(&args[1]).unwrap();
     let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
+
+    let listener = TcpListener::bind("127.0.0.1:1080").unwrap();
+    for stream in listener.incoming() {
+        let mut stream = stream.unwrap();
+        let mut buf: [u8; 1024] = [0; 1024];
+        stream.read(&mut buf).unwrap();
+        let mut reader = &buf[..];
+        let version = reader.read_u8().unwrap();
+        if version != 4 {
+            println!("unexpected version field {}", version);
+            continue; // TODO: respond with correct socks error message?
+        }
+        let command = reader.read_u8().unwrap();
+        if command != 1 {
+            println!("unexpected command {}", command);
+            continue; // TODO same
+        }
+        let port = reader.read_u16::<NetworkEndian>().unwrap();
+        let ip_addr = reader.read_u32::<NetworkEndian>().unwrap();
+        if ip_addr > 255 {
+            println!("unexpected invalid ip address {}", ip_addr);
+            continue;
+        }
+        let null_terminator = reader.read_u8().unwrap();
+        if null_terminator != 0 {
+            println!("expected zero-length username");
+            continue;
+        }
+        let mut str_buf: Vec<u8> = Vec::new();
+        loop {
+            let byte = reader.read_u8().unwrap();
+            if byte == 0 {
+                break;
+            }
+            str_buf.push(byte);
+        }
+        let domain = String::from_utf8(str_buf).unwrap();
+
+        let mut outbuf: [u8; 8] = [0; 8];
+        {
+            let mut writer = &mut outbuf[..];
+            writer.write_u8(0).unwrap();
+            writer.write_u8(0x5a).unwrap();
+            writer.write_u16::<NetworkEndian>(port).unwrap();
+            writer.write_u32::<NetworkEndian>(ip_addr).unwrap();
+        } // c'mon liveness detection :(
+        stream.write_all(&outbuf).unwrap();
+        let mut circuit = setup_new_circuit(&mut peers, &mut circ_id_tracker);
+        let dest = format!("{}:{}", domain, port);
+        let stream_id = circuit.begin(&dest);
+
+        let mut buf: [u8; 1024] = [0; 1024];
+        let len = stream.read(&mut buf).unwrap();
+        circuit.send(stream_id, &buf[..len]);
+        spawn(move || loop {
+            let response = circuit.recv();
+            if response.len() == 0 {
+                break;
+            }
+            stream.write_all(&response).unwrap();
+        });
+    }
+    /*
+    let mut circuit = setup_new_circuit(&mut peers, &mut circ_id_tracker);
+    let stream_id = circuit.begin("example.com:80");
+    let request = r#"GET / HTTP/1.1
+Host: example.com
+User-Agent: toroxide/0.1.0
+Accept: text/html
+Accept-Language: en-US,en;q=0.5
+Connection: close
+
+"#;
+    circuit.send(stream_id, request.as_bytes());
+    let response = circuit.recv_to_end();
+    print!("{}", String::from_utf8(response).unwrap());
+
+    let stream_id = circuit.begin("ip.seeip.org:80");
+    let request = r#"GET / HTTP/1.1
+Host: ip.seeip.org
+User-Agent: toroxide/0.1.0
+Connection: close
+
+"#;
+    circuit.send(stream_id, request.as_bytes());
+    let response = circuit.recv_to_end();
+    print!("{}", String::from_utf8(response).unwrap());
+    */
+}
+
+fn setup_new_circuit(
+    peers: &mut dir::TorPeerList,
+    circ_id_tracker: &mut IdTracker<u32>,
+) -> Circuit {
     let circ_id = circ_id_tracker.get_new_id();
     let guard_node = match peers.get_guard_node() {
         Some(node) => node,
@@ -200,29 +300,7 @@ fn main() {
         }
     };
     circuit.extend(&exit_node);
-    let stream_id = circuit.begin("example.com:80");
-    let request = r#"GET / HTTP/1.1
-Host: example.com
-User-Agent: toroxide/0.1.0
-Accept: text/html
-Accept-Language: en-US,en;q=0.5
-Connection: close
-
-"#;
-    circuit.send(stream_id, request.as_bytes());
-    let response = circuit.recv_to_end();
-    print!("{}", String::from_utf8(response).unwrap());
-
-    let stream_id = circuit.begin("ip.seeip.org:80");
-    let request = r#"GET / HTTP/1.1
-Host: ip.seeip.org
-User-Agent: toroxide/0.1.0
-Connection: close
-
-"#;
-    circuit.send(stream_id, request.as_bytes());
-    let response = circuit.recv_to_end();
-    print!("{}", String::from_utf8(response).unwrap());
+    circuit
 }
 
 impl Circuit {
@@ -573,6 +651,23 @@ impl Circuit {
     fn send(&mut self, stream_id: u16, data: &[u8]) {
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, data, stream_id);
         self.send_cell_bytes(bytes);
+    }
+
+    fn recv(&mut self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let cell = self.read_cell();
+        println!("{:?}", cell);
+        let relay_cell = match cell.command {
+            types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
+            _ => panic!("expected RELAY, got {:?}", cell.command),
+        };
+        println!("{}", relay_cell);
+        match relay_cell.relay_command {
+            types::RelayCommand::Data => buf.extend(relay_cell.get_data()),
+            types::RelayCommand::End => {}
+            _ => panic!("expected DATA or END, got {:?}", relay_cell.relay_command),
+        }
+        buf
     }
 
     fn recv_to_end(&mut self) -> Vec<u8> {

@@ -1,5 +1,6 @@
 use curl::easy::Easy;
 use curl::Error;
+use rand::{thread_rng, Rng};
 use sha2::{Digest, Sha256};
 use std::iter::FromIterator;
 use std::collections::HashSet;
@@ -76,10 +77,11 @@ impl TorPeerList {
     }
 
     pub fn get_guard_node(&self) -> Option<TorPeer> {
-        let node = match self.peers
+        let candidates = self.peers
             .iter()
-            .find(|node| node.is_usable && node.is_guard)
-        {
+            .filter(|node| node.is_usable && node.is_guard);
+        let collected: Vec<&PreTorPeer> = candidates.collect();
+        let node = match thread_rng().choose(&collected) {
             Some(node) => node,
             None => return None,
         };

@@ -3,6 +3,7 @@ use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream, SslVerifyMode};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Result, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 
 use dir::TorPeer;
 
@@ -70,6 +71,14 @@ impl TlsConnection {
             )
             .unwrap();
         buf
+    }
+
+    // "nonblocking" is a bit of a lie - it just means the read timeout is 16ms
+    pub fn set_nonblocking(&mut self) {
+        self.stream
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(16)))
+            .unwrap();
     }
 }
 

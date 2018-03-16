@@ -231,7 +231,16 @@ fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
             writer.write_u32::<NetworkEndian>(ip_addr).unwrap();
         } // c'mon liveness detection :(
         stream.write_all(&outbuf).unwrap();
-        let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker).unwrap();
+        let mut retries = 5;
+        let mut circuit_result = setup_new_circuit(&peers, &mut circ_id_tracker);
+        while circuit_result.is_err() && retries > 0 {
+            circuit_result = setup_new_circuit(&peers, &mut circ_id_tracker);
+            retries -= 1;
+        }
+        let mut circuit = match circuit_result {
+            Ok(circuit) => circuit,
+            Err(_) => break,
+        };
         let dest = format!("{}:{}", domain, port);
         let stream_id = match circuit.begin(&dest) {
             Ok(stream_id) => stream_id,
@@ -239,10 +248,14 @@ fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
         };
 
         stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
+            .set_read_timeout(Some(Duration::from_millis(16)))
             .unwrap();
 
+        let mut stop = false;
         spawn(move || loop {
+            if stop {
+                break;
+            }
             let mut buf: [u8; types::RELAY_PAYLOAD_LEN] = [0; types::RELAY_PAYLOAD_LEN];
             loop {
                 let len = match stream.read(&mut buf) {
@@ -251,8 +264,19 @@ fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
                 };
                 circuit.send(stream_id, &buf[..len]).unwrap();
             }
-            let response = circuit.recv().unwrap();
-            if response.len() > 0 {
+            loop {
+                // If this returns an error, either there was nothing to read or we read invalid
+                // data ( :/ ) so just go around again...?
+                let response = match circuit.recv() {
+                    Ok(response) => response,
+                    Err(_) => break,
+                };
+                // If the response is length 0, either we got a cell of length 0 or a RELAY_END. We
+                // really need to figure out the signalling story here...
+                if response.len() == 0 {
+                    stop = true;
+                    break;
+                }
                 stream.write_all(&response).unwrap();
             }
         });
@@ -754,7 +778,10 @@ impl Circuit {
         self.send_cell_bytes(bytes)
     }
 
+    // I think this will return an Err if there's nothing to read... (but also it'll return an Err
+    // if we get invalid data, so... I need some sort of "would block" indication?
     fn recv(&mut self) -> Result<Vec<u8>, ()> {
+        self.tls_connection.set_nonblocking();
         let mut buf = Vec::new();
         let cell = self.read_cell()?;
         println!("{:?}", cell);

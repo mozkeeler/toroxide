@@ -163,18 +163,28 @@ impl<'a> dir::Fetch for CircuitDirectoryFetcher<'a> {
 }
 
 fn usage(program: &str) {
-    println!("Usage: {} <directory server>:<port>", program);
+    println!("Usage: {} <directory server>:<port> <demo|proxy>", program);
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
+    if args.len() != 3 {
         usage(&args[0]);
         return;
     }
-    let mut peers = dir::get_tor_peers(&args[1]).unwrap();
-    let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
+    let peers = dir::get_tor_peers(&args[1]).unwrap();
+    let circ_id_tracker: IdTracker<u32> = IdTracker::new();
 
+    if args[2] == "demo" {
+        do_demo(peers, circ_id_tracker);
+    } else if args[2] == "proxy" {
+        do_proxy(peers, circ_id_tracker);
+    } else {
+        panic!("unknown command '{}'", args[2]);
+    }
+}
+
+fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
     let listener = TcpListener::bind("127.0.0.1:1080").unwrap();
     for stream in listener.incoming() {
         let mut stream = stream.unwrap();
@@ -221,7 +231,7 @@ fn main() {
             writer.write_u32::<NetworkEndian>(ip_addr).unwrap();
         } // c'mon liveness detection :(
         stream.write_all(&outbuf).unwrap();
-        let mut circuit = setup_new_circuit(&mut peers, &mut circ_id_tracker);
+        let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker);
         let dest = format!("{}:{}", domain, port);
         let stream_id = circuit.begin(&dest);
 
@@ -236,8 +246,10 @@ fn main() {
             stream.write_all(&response).unwrap();
         });
     }
-    /*
-    let mut circuit = setup_new_circuit(&mut peers, &mut circ_id_tracker);
+}
+
+fn do_demo(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
+    let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker);
     let stream_id = circuit.begin("example.com:80");
     let request = r#"GET / HTTP/1.1
 Host: example.com
@@ -261,13 +273,9 @@ Connection: close
     circuit.send(stream_id, request.as_bytes());
     let response = circuit.recv_to_end();
     print!("{}", String::from_utf8(response).unwrap());
-    */
 }
 
-fn setup_new_circuit(
-    peers: &mut dir::TorPeerList,
-    circ_id_tracker: &mut IdTracker<u32>,
-) -> Circuit {
+fn setup_new_circuit(peers: &dir::TorPeerList, circ_id_tracker: &mut IdTracker<u32>) -> Circuit {
     let circ_id = circ_id_tracker.get_new_id();
     let guard_node = match peers.get_guard_node() {
         Some(node) => node,
@@ -284,7 +292,7 @@ fn setup_new_circuit(
         let mut fetcher = CircuitDirectoryFetcher {
             circuit: &mut circuit,
         };
-        match peers.get_interior_node(&mut fetcher) {
+        match peers.get_interior_node(&[&guard_node], &mut fetcher) {
             Some(node) => node,
             None => panic!("couldn't find interior node?"),
         }
@@ -294,7 +302,7 @@ fn setup_new_circuit(
         let mut fetcher = CircuitDirectoryFetcher {
             circuit: &mut circuit,
         };
-        match peers.get_exit_node(&mut fetcher) {
+        match peers.get_exit_node(&[&guard_node, &interior_node], &mut fetcher) {
             Some(node) => node,
             None => panic!("couldn't find exit node?"),
         }
@@ -629,6 +637,12 @@ impl Circuit {
         };
         println!("{}", relay_cell);
         // TODO: verify that this is a RELAY_CONNECTED cell...
+        if relay_cell.relay_command != types::RelayCommand::Connected {
+            println!(
+                "expected RELAY_CONNECTED, got {:?}",
+                relay_cell.relay_command
+            );
+        }
         stream_id
     }
     fn begin(&mut self, addrport: &str) -> u16 {

@@ -75,54 +75,53 @@ impl TorPeerList {
         }
     }
 
-    pub fn get_guard_node(&mut self) -> Option<TorPeer> {
+    pub fn get_guard_node(&self) -> Option<TorPeer> {
         let node = match self.peers
             .iter()
             .find(|node| node.is_usable && node.is_guard)
         {
-            Some(node) => node.clone(),
+            Some(node) => node,
             None => return None,
         };
-        if let Some(taken) = self.peers.take(&node) {
-            match taken.to_tor_peer(&self.hostport, &mut EasyFetcher {}) {
-                Ok(peer) => Some(peer),
-                Err(()) => None, // retry in this case?
-            }
-        } else {
-            None // this shouldn't happen but still
+        match node.to_tor_peer(&self.hostport, &mut EasyFetcher {}) {
+            Ok(peer) => Some(peer),
+            Err(()) => None, // retry in this case?
         }
     }
 
-    pub fn get_interior_node<F: Fetch>(&mut self, fetcher: &mut F) -> Option<TorPeer> {
-        let node = match self.peers.iter().find(|node| node.is_usable) {
-            Some(node) => node.clone(),
-            None => return None,
-        };
-        if let Some(taken) = self.peers.take(&node) {
-            match taken.to_tor_peer(&self.hostport, fetcher) {
-                Ok(peer) => Some(peer),
-                Err(()) => None, // retry in this case?
-            }
-        } else {
-            None // this shouldn't happen but still
-        }
-    }
-
-    pub fn get_exit_node<F: Fetch>(&mut self, fetcher: &mut F) -> Option<TorPeer> {
+    pub fn get_interior_node<F: Fetch>(
+        &self,
+        blacklist: &[&TorPeer],
+        fetcher: &mut F,
+    ) -> Option<TorPeer> {
         let node = match self.peers
             .iter()
-            .find(|node| node.is_usable && node.is_exit)
+            .find(|node| node.is_usable && node.not_in(blacklist))
+        {
+            Some(node) => node,
+            None => return None,
+        };
+        match node.to_tor_peer(&self.hostport, fetcher) {
+            Ok(peer) => Some(peer),
+            Err(()) => None, // retry in this case?
+        }
+    }
+
+    pub fn get_exit_node<F: Fetch>(
+        &self,
+        blacklist: &[&TorPeer],
+        fetcher: &mut F,
+    ) -> Option<TorPeer> {
+        let node = match self.peers
+            .iter()
+            .find(|node| node.is_usable && node.is_exit && node.not_in(blacklist))
         {
             Some(node) => node.clone(),
             None => return None,
         };
-        if let Some(taken) = self.peers.take(&node) {
-            match taken.to_tor_peer(&self.hostport, fetcher) {
-                Ok(peer) => Some(peer),
-                Err(()) => None, // retry in this case?
-            }
-        } else {
-            None // this shouldn't happen but still
+        match node.to_tor_peer(&self.hostport, fetcher) {
+            Ok(peer) => Some(peer),
+            Err(()) => None, // retry in this case?
         }
     }
 }
@@ -243,6 +242,16 @@ impl PreTorPeer {
             ed25519_id_key: ed25519_id_key,
             node_id: self.node_id,
         })
+    }
+
+    fn not_in(&self, blacklist: &[&TorPeer]) -> bool {
+        for peer in blacklist {
+            // TODO: something stronger than node_id?
+            if self.node_id == peer.node_id {
+                return false;
+            }
+        }
+        true
     }
 }
 

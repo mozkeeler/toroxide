@@ -8,6 +8,7 @@ use dir;
 use keys;
 
 const PAYLOAD_LEN: usize = 509;
+pub const RELAY_PAYLOAD_LEN: usize = PAYLOAD_LEN - 11;
 
 #[derive(Debug)]
 pub struct Cell {
@@ -593,9 +594,9 @@ impl RelayCell {
         // correspond to... anything?
         let length = reader.read_u16::<NetworkEndian>()?;
         // So, we have an indication of the length of the data in the relay cell, but there's
-        // actually always supposed to be PAYLOAD_LEN - 11 bytes (the rest padded 0 I suppose).
-        let mut data: Vec<u8> = Vec::with_capacity(PAYLOAD_LEN - 11);
-        data.resize(PAYLOAD_LEN - 11, 0);
+        // actually always supposed to be RELAY_PAYLOAD_LEN bytes (the rest padded 0).
+        let mut data: Vec<u8> = Vec::with_capacity(RELAY_PAYLOAD_LEN);
+        data.resize(RELAY_PAYLOAD_LEN, 0);
         reader.read_exact(&mut data)?;
         Ok(RelayCell {
             relay_command: relay_command,
@@ -611,7 +612,7 @@ impl RelayCell {
     /// running digest to set its value (which is calculated in part based on the rest of the bytes
     /// of the `RelayCell`, with the digest set to 0).
     pub fn new(relay_command: RelayCommand, stream_id: u16, data: Vec<u8>) -> RelayCell {
-        assert!(data.len() <= PAYLOAD_LEN - 11);
+        assert!(data.len() <= RELAY_PAYLOAD_LEN);
         RelayCell {
             relay_command: relay_command,
             recognized: 0,
@@ -640,11 +641,11 @@ impl RelayCell {
         writer.write_u16::<NetworkEndian>(self.stream_id)?;
         writer.write_u32::<NetworkEndian>(self.digest)?;
         writer.write_u16::<NetworkEndian>(self.length)?;
-        // This always gets padded with 0 bytes to PAYLOAD_LEN - 11 bytes
+        // This always gets padded with 0 bytes to RELAY_PAYLOAD_LEN bytes
         writer.write_all(&self.data)?;
         // TODO: this should be a const
-        if self.data.len() < PAYLOAD_LEN - 11 {
-            let padding_size = PAYLOAD_LEN - 11 - self.data.len();
+        if self.data.len() < RELAY_PAYLOAD_LEN {
+            let padding_size = RELAY_PAYLOAD_LEN - self.data.len();
             let mut zeroes = Vec::with_capacity(padding_size);
             zeroes.resize(padding_size, 0);
             writer.write_all(&zeroes)?;

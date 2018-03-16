@@ -39,7 +39,7 @@ use std::io::prelude::*;
 use std::net::TcpListener;
 use std::ops::Mul;
 use std::thread::spawn;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Circuit {
     /// TLS connection with the first hop in the circuit.
@@ -233,17 +233,28 @@ fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
         stream.write_all(&outbuf).unwrap();
         let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker).unwrap();
         let dest = format!("{}:{}", domain, port);
-        let stream_id = circuit.begin(&dest).unwrap();
+        let stream_id = match circuit.begin(&dest) {
+            Ok(stream_id) => stream_id,
+            Err(_) => break,
+        };
 
-        let mut buf: [u8; 1024] = [0; 1024];
-        let len = stream.read(&mut buf).unwrap();
-        circuit.send(stream_id, &buf[..len]).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
         spawn(move || loop {
-            let response = circuit.recv().unwrap();
-            if response.len() == 0 {
-                break;
+            let mut buf: [u8; types::RELAY_PAYLOAD_LEN] = [0; types::RELAY_PAYLOAD_LEN];
+            loop {
+                let len = match stream.read(&mut buf) {
+                    Ok(len) => len,
+                    Err(_) => break,
+                };
+                circuit.send(stream_id, &buf[..len]).unwrap();
             }
-            stream.write_all(&response).unwrap();
+            let response = circuit.recv().unwrap();
+            if response.len() > 0 {
+                stream.write_all(&response).unwrap();
+            }
         });
     }
 }

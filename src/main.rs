@@ -137,7 +137,7 @@ struct CircuitDirectoryFetcher<'a> {
 
 impl<'a> dir::Fetch for CircuitDirectoryFetcher<'a> {
     fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()> {
-        let stream_id = self.circuit.begin_dir();
+        let stream_id = self.circuit.begin_dir()?;
         // uri will be of the form 'http://<host:port>/some/path/.../' - we just want the
         // '/some/path/.../' part.
         let path_parts = uri.split('/').skip(3);
@@ -147,9 +147,9 @@ impl<'a> dir::Fetch for CircuitDirectoryFetcher<'a> {
             path.push_str(part);
         }
         let request = format!("GET {} HTTP/1.0\r\n\r\n", path);
-        self.circuit.send(stream_id, request.as_bytes());
+        self.circuit.send(stream_id, request.as_bytes())?;
         // This will be an HTTP response like "HTTP/1.0 200 OK..." - we just want the body.
-        let response = self.circuit.recv_to_end();
+        let response = self.circuit.recv_to_end()?;
         let as_string = match String::from_utf8(response) {
             Ok(as_string) => as_string,
             Err(_) => return Err(()),
@@ -231,15 +231,15 @@ fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
             writer.write_u32::<NetworkEndian>(ip_addr).unwrap();
         } // c'mon liveness detection :(
         stream.write_all(&outbuf).unwrap();
-        let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker);
+        let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker).unwrap();
         let dest = format!("{}:{}", domain, port);
-        let stream_id = circuit.begin(&dest);
+        let stream_id = circuit.begin(&dest).unwrap();
 
         let mut buf: [u8; 1024] = [0; 1024];
         let len = stream.read(&mut buf).unwrap();
-        circuit.send(stream_id, &buf[..len]);
+        circuit.send(stream_id, &buf[..len]).unwrap();
         spawn(move || loop {
-            let response = circuit.recv();
+            let response = circuit.recv().unwrap();
             if response.len() == 0 {
                 break;
             }
@@ -249,8 +249,8 @@ fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
 }
 
 fn do_demo(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
-    let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker);
-    let stream_id = circuit.begin("example.com:80");
+    let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker).unwrap();
+    let stream_id = circuit.begin("example.com:80").unwrap();
     let request = r#"GET / HTTP/1.1
 Host: example.com
 User-Agent: toroxide/0.1.0
@@ -259,56 +259,59 @@ Accept-Language: en-US,en;q=0.5
 Connection: close
 
 "#;
-    circuit.send(stream_id, request.as_bytes());
-    let response = circuit.recv_to_end();
+    circuit.send(stream_id, request.as_bytes()).unwrap();
+    let response = circuit.recv_to_end().unwrap();
     print!("{}", String::from_utf8(response).unwrap());
 
-    let stream_id = circuit.begin("ip.seeip.org:80");
+    let stream_id = circuit.begin("ip.seeip.org:80").unwrap();
     let request = r#"GET / HTTP/1.1
 Host: ip.seeip.org
 User-Agent: toroxide/0.1.0
 Connection: close
 
 "#;
-    circuit.send(stream_id, request.as_bytes());
-    let response = circuit.recv_to_end();
+    circuit.send(stream_id, request.as_bytes()).unwrap();
+    let response = circuit.recv_to_end().unwrap();
     print!("{}", String::from_utf8(response).unwrap());
 }
 
-fn setup_new_circuit(peers: &dir::TorPeerList, circ_id_tracker: &mut IdTracker<u32>) -> Circuit {
+fn setup_new_circuit(
+    peers: &dir::TorPeerList,
+    circ_id_tracker: &mut IdTracker<u32>,
+) -> Result<Circuit, ()> {
     let circ_id = circ_id_tracker.get_new_id();
     let guard_node = match peers.get_guard_node() {
         Some(node) => node,
-        None => panic!("couldn't find guard node?"),
+        None => return Err(()),
     };
     let mut circuit = Circuit::new(&guard_node, circ_id);
-    circuit.negotiate_versions();
-    circuit.read_certs(&guard_node.get_ed25519_id_key());
-    circuit.read_auth_challenge();
-    circuit.send_certs_and_authenticate_cells();
-    circuit.read_netinfo();
-    circuit.create_fast();
+    circuit.negotiate_versions()?;
+    circuit.read_certs(&guard_node.get_ed25519_id_key())?;
+    circuit.read_auth_challenge()?;
+    circuit.send_certs_and_authenticate_cells()?;
+    circuit.read_netinfo()?;
+    circuit.create_fast()?;
     let interior_node = {
         let mut fetcher = CircuitDirectoryFetcher {
             circuit: &mut circuit,
         };
         match peers.get_interior_node(&[&guard_node], &mut fetcher) {
             Some(node) => node,
-            None => panic!("couldn't find interior node?"),
+            None => return Err(()),
         }
     };
-    circuit.extend(&interior_node);
+    circuit.extend(&interior_node)?;
     let exit_node = {
         let mut fetcher = CircuitDirectoryFetcher {
             circuit: &mut circuit,
         };
         match peers.get_exit_node(&[&guard_node, &interior_node], &mut fetcher) {
             Some(node) => node,
-            None => panic!("couldn't find exit node?"),
+            None => return Err(()),
         }
     };
-    circuit.extend(&exit_node);
-    circuit
+    circuit.extend(&exit_node)?;
+    Ok(circuit)
 }
 
 impl Circuit {
@@ -324,70 +327,89 @@ impl Circuit {
         }
     }
 
-    fn negotiate_versions(&mut self) {
+    fn negotiate_versions(&mut self) -> Result<(), ()> {
         let versions = types::VersionsCell::new(vec![4]);
         let mut buf: Vec<u8> = Vec::new();
-        versions.write_to(&mut buf).unwrap();
+        if versions.write_to(&mut buf).is_err() {
+            return Err(());
+        }
         match self.tls_connection.write(&buf) {
-            Ok(len) => println!("sent {}", len),
-            Err(e) => panic!(e),
+            Ok(_) => {}
+            Err(_) => return Err(()),
         };
-        let peer_versions = types::VersionsCell::read_new(&mut self.tls_connection).unwrap();
-        let version = versions.negotiate(&peer_versions).unwrap();
+        let peer_versions = match types::VersionsCell::read_new(&mut self.tls_connection) {
+            Ok(peer_versions) => peer_versions,
+            Err(_) => return Err(()),
+        };
+        let version = match versions.negotiate(&peer_versions) {
+            Ok(version) => version,
+            Err(_) => return Err(()),
+        };
         println!("negotiated version {}", version);
+        Ok(())
     }
 
-    fn read_certs(&mut self, expected_ed25519_id_key: &[u8; 32]) {
-        // Also assert versions negotiated?
-        let cell = types::Cell::read_new(&mut self.tls_connection).unwrap();
-        match cell.command {
-            types::Command::Certs => match types::CertsCell::read_new(&mut &cell.payload[..]) {
-                Ok(certs_cell) => {
-                    let responder_certs = ResponderCerts::new(certs_cell.decode_certs()).unwrap();
-                    if responder_certs
-                        .validate(
-                            expected_ed25519_id_key,
-                            self.tls_connection.get_peer_cert_hash(),
-                        )
-                        .is_ok()
-                    {
-                        self.responder_certs = Some(responder_certs);
-                    } // TODO: else indicate that we need to close the connection?
-                }
-                Err(msg) => println!("{}", msg),
-            },
-            _ => panic!("Expected CERTS, got {:?}", cell.command),
+    fn read_certs(&mut self, expected_ed25519_id_key: &[u8; 32]) -> Result<(), ()> {
+        let cell = match types::Cell::read_new(&mut self.tls_connection) {
+            Ok(cell) => cell,
+            Err(_) => return Err(()),
         };
+        if cell.command != types::Command::Certs {
+            return Err(());
+        }
+        let certs_cell = match types::CertsCell::read_new(&mut &cell.payload[..]) {
+            Ok(certs_cell) => certs_cell,
+            Err(_) => return Err(()),
+        };
+        let responder_certs = match ResponderCerts::new(certs_cell.decode_certs()) {
+            Ok(responder_certs) => responder_certs,
+            Err(_) => return Err(()),
+        };
+        if responder_certs
+            .validate(
+                expected_ed25519_id_key,
+                self.tls_connection.get_peer_cert_hash(),
+            )
+            .is_err()
+        {
+            return Err(());
+        }
+        self.responder_certs = Some(responder_certs);
+        Ok(())
     }
 
-    fn read_auth_challenge(&mut self) {
-        // Also assert everything beforehand...?
-        let cell = types::Cell::read_new(&mut self.tls_connection).unwrap();
-        let auth_challenge = match cell.command {
-            types::Command::AuthChallenge => {
-                match types::AuthChallengeCell::read_new(&mut &cell.payload[..]) {
-                    Ok(auth_challenge_cell) => auth_challenge_cell,
-                    Err(msg) => panic!("error decoding AUTH_CHALLENGE cell: {}", msg),
-                }
-            }
-            _ => panic!("Expected AUTH_CHALLENGE, got {:?}", cell.command),
+    fn read_auth_challenge(&mut self) -> Result<(), ()> {
+        let cell = match types::Cell::read_new(&mut self.tls_connection) {
+            Ok(cell) => cell,
+            Err(_) => return Err(()),
+        };
+        if cell.command != types::Command::AuthChallenge {
+            return Err(());
+        }
+        let auth_challenge = match types::AuthChallengeCell::read_new(&mut &cell.payload[..]) {
+            Ok(auth_challenge_cell) => auth_challenge_cell,
+            Err(_) => return Err(()),
         };
         println!("{:?}", auth_challenge);
         if !auth_challenge.has_auth_type(types::AuthType::Ed25519Sha256Rfc5705) {
-            println!("peer doesn't support the auth type we require");
-            // TODO: error out here somehow
+            return Err(());
         }
         // It seems we don't actually have to do anything else here, since the only thing we would
         // need is actually in our connection's read digest.
+        Ok(())
     }
 
-    fn send_certs_and_authenticate_cells(&mut self) {
+    fn send_certs_and_authenticate_cells(&mut self) -> Result<(), ()> {
         let initiator_certs = InitiatorCerts::new();
         let certs_cell = initiator_certs.to_certs_cell();
         let mut buf: Vec<u8> = Vec::new();
-        certs_cell.write_to(&mut buf).unwrap();
+        if certs_cell.write_to(&mut buf).is_err() {
+            return Err(());
+        }
         let cell = types::Cell::new(0, types::Command::Certs, buf);
-        cell.write_to(&mut self.tls_connection).unwrap();
+        if cell.write_to(&mut self.tls_connection).is_err() {
+            return Err(());
+        };
 
         // tor-spec.txt section 4.4.2: With Ed25519-SHA256-RFC5705 link authentication, the
         // authentication field of the AUTHENTICATE cell is as follows:
@@ -424,7 +446,7 @@ impl Circuit {
         // SID
         let responder_certs = match self.responder_certs {
             Some(ref responder_certs) => responder_certs,
-            None => panic!("invalid state - call read_certs first"),
+            None => return Err(()),
         };
         let sid = responder_certs
             .rsa_identity_cert
@@ -453,7 +475,10 @@ impl Circuit {
         buf.extend(tlssecrets);
         // RAND
         let mut rand = [0; 24];
-        let mut csprng: OsRng = OsRng::new().unwrap();
+        let mut csprng: OsRng = match OsRng::new() {
+            Ok(csprng) => csprng,
+            Err(_) => return Err(()),
+        };
         csprng.fill_bytes(&mut rand);
         buf.extend(rand.iter());
         // SIG
@@ -464,20 +489,28 @@ impl Circuit {
         let authenticate_cell =
             types::AuthenticateCell::new(types::AuthType::Ed25519Sha256Rfc5705, buf);
         let mut buf: Vec<u8> = Vec::new();
-        authenticate_cell.write_to(&mut buf).unwrap();
+        if authenticate_cell.write_to(&mut buf).is_err() {
+            return Err(());
+        }
         let cell = types::Cell::new(0, types::Command::Authenticate, buf);
-        cell.write_to(&mut self.tls_connection).unwrap();
+        if cell.write_to(&mut self.tls_connection).is_err() {
+            return Err(());
+        }
+        Ok(())
     }
 
-    fn read_netinfo(&mut self) {
-        let cell = types::Cell::read_new(&mut self.tls_connection).unwrap();
+    fn read_netinfo(&mut self) -> Result<(), ()> {
+        let cell = match types::Cell::read_new(&mut self.tls_connection) {
+            Ok(cell) => cell,
+            Err(_) => return Err(()),
+        };
         println!("{:?}", cell);
-        let netinfo = match cell.command {
-            types::Command::Netinfo => match types::NetinfoCell::read_new(&mut &cell.payload[..]) {
-                Ok(netinfo_cell) => netinfo_cell,
-                Err(msg) => panic!("error decoding NETINFO cell: {}", msg),
-            },
-            _ => panic!("Expected NETINFO, got {:?}", cell.command),
+        if cell.command != types::Command::Netinfo {
+            return Err(());
+        }
+        let netinfo = match types::NetinfoCell::read_new(&mut &cell.payload[..]) {
+            Ok(netinfo_cell) => netinfo_cell,
+            Err(_) => return Err(()),
         };
         println!("{:?}", netinfo);
 
@@ -489,34 +522,53 @@ impl Circuit {
         let localhost = types::OrAddress::IPv4Address([127, 0, 0, 1]);
         let netinfo = types::NetinfoCell::new(timestamp, other_or_address, localhost);
         let mut buf: Vec<u8> = Vec::new();
-        netinfo.write_to(&mut buf).unwrap();
+        if netinfo.write_to(&mut buf).is_err() {
+            return Err(());
+        }
         let cell = types::Cell::new(0, types::Command::Netinfo, buf);
-        cell.write_to(&mut self.tls_connection).unwrap();
+        if cell.write_to(&mut self.tls_connection).is_err() {
+            return Err(());
+        }
+        Ok(())
     }
 
-    fn create_fast(&mut self) {
+    fn create_fast(&mut self) -> Result<(), ()> {
         let mut x = [0; 20];
-        let mut csprng: OsRng = OsRng::new().unwrap();
+        let mut csprng: OsRng = match OsRng::new() {
+            Ok(csprng) => csprng,
+            Err(_) => return Err(()),
+        };
         csprng.fill_bytes(&mut x);
         let create_fast_cell = types::CreateFastCell::new(x);
         let mut buf: Vec<u8> = Vec::new();
-        create_fast_cell.write_to(&mut buf).unwrap();
+        if create_fast_cell.write_to(&mut buf).is_err() {
+            return Err(());
+        }
         let cell = types::Cell::new(self.circ_id, types::Command::CreateFast, buf);
 
-        cell.write_to(&mut self.tls_connection).unwrap();
-        let cell = types::Cell::read_new(&mut self.tls_connection).unwrap();
+        if cell.write_to(&mut self.tls_connection).is_err() {
+            return Err(());
+        }
+        let cell = match types::Cell::read_new(&mut self.tls_connection) {
+            Ok(cell) => cell,
+            Err(_) => return Err(()),
+        };
         println!("{:?}", cell);
-        let circuit_keys = match cell.command {
-            types::Command::CreatedFast => {
-                let created_fast =
-                    types::CreatedFastCell::read_new(&mut &cell.payload[..]).unwrap();
-                println!("{:?}", created_fast);
-                tor_kdf(&x, created_fast.get_y(), created_fast.get_kh())
-            }
-            types::Command::Destroy => panic!("got DESTROY cell"),
-            _ => panic!("Expected CREATED_FAST or DESTROY, got {:?}", cell.command),
+        // TODO: handle DESTROY differently here?
+        if cell.command != types::Command::CreatedFast {
+            return Err(());
+        }
+        let created_fast = match types::CreatedFastCell::read_new(&mut &cell.payload[..]) {
+            Ok(created_fast) => created_fast,
+            Err(_) => return Err(()),
+        };
+        println!("{:?}", created_fast);
+        let circuit_keys = match tor_kdf(&x, created_fast.get_y(), created_fast.get_kh()) {
+            Ok(circuit_keys) => circuit_keys,
+            Err(_) => return Err(()),
         };
         self.circuit_keys.push(circuit_keys);
+        Ok(())
     }
 
     // TODO: stream_id == 0 for control commands - how do we make this easy/automatic?
@@ -551,7 +603,7 @@ impl Circuit {
         bytes
     }
 
-    fn decrypt_cell_bytes(&mut self, in_bytes: &[u8]) -> types::RelayCell {
+    fn decrypt_cell_bytes(&mut self, in_bytes: &[u8]) -> Result<types::RelayCell, ()> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(in_bytes);
         for circuit_keys in self.circuit_keys.iter_mut() {
@@ -567,10 +619,13 @@ impl Circuit {
             // TODO: handle digest, things not for us, etc.
             bytes = decrypted_cell_bytes;
         }
-        types::RelayCell::read_new(&mut &bytes[..]).unwrap()
+        match types::RelayCell::read_new(&mut &bytes[..]) {
+            Ok(decrypted_cell) => Ok(decrypted_cell),
+            Err(_) => Err(()),
+        }
     }
 
-    fn send_cell_bytes(&mut self, bytes: Vec<u8>) {
+    fn send_cell_bytes(&mut self, bytes: Vec<u8>) -> Result<(), ()> {
         let command = if self.relay_early_count < 8 {
             self.relay_early_count += 1;
             types::Command::RelayEarly
@@ -578,129 +633,150 @@ impl Circuit {
             types::Command::Relay
         };
         let cell = types::Cell::new(self.circ_id, command, bytes);
-        cell.write_to(&mut self.tls_connection).unwrap();
+        match cell.write_to(&mut self.tls_connection) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(()),
+        }
     }
 
-    fn read_cell(&mut self) -> types::Cell {
-        types::Cell::read_new(&mut self.tls_connection).unwrap()
+    fn read_cell(&mut self) -> Result<types::Cell, ()> {
+        match types::Cell::read_new(&mut self.tls_connection) {
+            Ok(cell) => Ok(cell),
+            Err(_) => Err(()),
+        }
     }
 
-    fn extend(&mut self, node: &dir::TorPeer) {
+    fn extend(&mut self, node: &dir::TorPeer) -> Result<(), ()> {
         println!("attempting to extend to {:?}", node);
         let client_keypair = keys::Curve25519Keypair::new();
         let ntor_client_handshake = types::NtorClientHandshake::new(node, &client_keypair);
         let mut ntor_client_handshake_bytes = Vec::new();
-        ntor_client_handshake
+        if ntor_client_handshake
             .write_to(&mut ntor_client_handshake_bytes)
-            .unwrap();
+            .is_err()
+        {
+            return Err(());
+        }
         let extend2 = types::Extend2Cell::new(node, ntor_client_handshake_bytes);
         let mut extend2_bytes = Vec::new();
-        extend2.write_to(&mut extend2_bytes).unwrap();
+        if extend2.write_to(&mut extend2_bytes).is_err() {
+            return Err(());
+        }
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Extend2, &extend2_bytes, 0);
-        self.send_cell_bytes(bytes);
-        let cell = self.read_cell();
+        self.send_cell_bytes(bytes)?;
+        let cell = self.read_cell()?;
         println!("{:?}", cell);
-        let relay_cell = match cell.command {
-            types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
-            _ => panic!("expected RELAY, got {:?}", cell.command),
-        };
+        if cell.command != types::Command::Relay {
+            return Err(());
+        }
+        let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
         println!("{}", relay_cell);
-        let extended2 = match relay_cell.relay_command {
-            types::RelayCommand::Extended2 =>
-                // The contents of an EXTENDED2 relay cell is the same as a CREATED2 cell
-                types::Created2Cell::read_new(&mut &relay_cell.data[..]).unwrap(),
-            _ => panic!("expected EXTENDED2, got {:?}", relay_cell.relay_command),
+        if relay_cell.relay_command != types::RelayCommand::Extended2 {
+            return Err(());
+        }
+        // The contents of an EXTENDED2 relay cell is the same as a CREATED2 cell
+        let extended2 = match types::Created2Cell::read_new(&mut &relay_cell.data[..]) {
+            Ok(extended2) => extended2,
+            Err(_) => return Err(()),
         };
-        if let Ok(circuit_keys) = ntor_handshake(
+        let circuit_keys = match ntor_handshake(
             &extended2,
             node.get_node_id(),
             node.get_ntor_key(),
             client_keypair.get_public_key_bytes(),
             client_keypair.get_secret_key_bytes(),
         ) {
-            self.circuit_keys.push(circuit_keys);
-        }
+            Ok(circuit_keys) => circuit_keys,
+            Err(_) => return Err(()),
+        };
+        self.circuit_keys.push(circuit_keys);
+        Ok(())
     }
 
     // returns what stream id we picked
     /// begin_command must be types::RelayCommand::RELAY_BEGIN or
     /// types::RelayCommand::RELAY_BEGIN_DIR for this to be useful
-    fn begin_common(&mut self, begin_command: types::RelayCommand, begin_bytes: &[u8]) -> u16 {
+    fn begin_common(
+        &mut self,
+        begin_command: types::RelayCommand,
+        begin_bytes: &[u8],
+    ) -> Result<u16, ()> {
         let stream_id = self.used_stream_ids.get_new_id();
         let bytes = self.encrypt_cell_bytes(begin_command, begin_bytes, stream_id);
-        self.send_cell_bytes(bytes);
-        let cell = self.read_cell();
+        self.send_cell_bytes(bytes)?;
+        let cell = self.read_cell()?;
         println!("{:?}", cell);
-        let relay_cell = match cell.command {
-            types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
-            _ => panic!("expected RELAY, got {:?}", cell.command),
-        };
-        println!("{}", relay_cell);
-        // TODO: verify that this is a RELAY_CONNECTED cell...
-        if relay_cell.relay_command != types::RelayCommand::Connected {
-            println!(
-                "expected RELAY_CONNECTED, got {:?}",
-                relay_cell.relay_command
-            );
+        if cell.command != types::Command::Relay {
+            return Err(());
         }
-        stream_id
+        let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
+        println!("{}", relay_cell);
+        if relay_cell.relay_command != types::RelayCommand::Connected {
+            return Err(());
+        }
+        Ok(stream_id)
     }
-    fn begin(&mut self, addrport: &str) -> u16 {
+
+    fn begin(&mut self, addrport: &str) -> Result<u16, ()> {
         let begin = types::BeginCell::new(addrport);
         println!("{:?}", begin);
         // Hmmm maybe I wouldn't have to do all this "make a cell then make a vec then write_to it"
         // if I defined a trait...?
         let mut begin_bytes: Vec<u8> = Vec::new();
-        begin.write_to(&mut begin_bytes).unwrap();
+        if begin.write_to(&mut begin_bytes).is_err() {
+            return Err(());
+        }
         self.begin_common(types::RelayCommand::Begin, &begin_bytes)
     }
 
-    fn begin_dir(&mut self) -> u16 {
+    fn begin_dir(&mut self) -> Result<u16, ()> {
         let begin = types::BeginDirCell::new();
         let mut begin_bytes: Vec<u8> = Vec::new();
-        begin.write_to(&mut begin_bytes).unwrap();
+        if begin.write_to(&mut begin_bytes).is_err() {
+            return Err(());
+        }
         self.begin_common(types::RelayCommand::BeginDir, &begin_bytes)
     }
 
-    fn send(&mut self, stream_id: u16, data: &[u8]) {
+    fn send(&mut self, stream_id: u16, data: &[u8]) -> Result<(), ()> {
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, data, stream_id);
-        self.send_cell_bytes(bytes);
+        self.send_cell_bytes(bytes)
     }
 
-    fn recv(&mut self) -> Vec<u8> {
+    fn recv(&mut self) -> Result<Vec<u8>, ()> {
         let mut buf = Vec::new();
-        let cell = self.read_cell();
+        let cell = self.read_cell()?;
         println!("{:?}", cell);
-        let relay_cell = match cell.command {
-            types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
-            _ => panic!("expected RELAY, got {:?}", cell.command),
-        };
+        if cell.command != types::Command::Relay {
+            return Err(());
+        }
+        let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
         println!("{}", relay_cell);
         match relay_cell.relay_command {
             types::RelayCommand::Data => buf.extend(relay_cell.get_data()),
             types::RelayCommand::End => {}
-            _ => panic!("expected DATA or END, got {:?}", relay_cell.relay_command),
+            _ => return Err(()),
         }
-        buf
+        Ok(buf)
     }
 
-    fn recv_to_end(&mut self) -> Vec<u8> {
+    fn recv_to_end(&mut self) -> Result<Vec<u8>, ()> {
         let mut buf = Vec::new();
         loop {
-            let cell = self.read_cell();
+            let cell = self.read_cell()?;
             println!("{:?}", cell);
-            let relay_cell = match cell.command {
-                types::Command::Relay => self.decrypt_cell_bytes(&cell.payload),
-                _ => panic!("expected RELAY, got {:?}", cell.command),
-            };
+            if cell.command != types::Command::Relay {
+                return Err(());
+            }
+            let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
             println!("{}", relay_cell);
             match relay_cell.relay_command {
                 types::RelayCommand::Data => buf.extend(relay_cell.get_data()),
                 types::RelayCommand::End => break,
-                _ => panic!("expected DATA or END, got {:?}", relay_cell.relay_command),
+                _ => return Err(()),
             }
         }
-        buf
+        Ok(buf)
     }
 }
 
@@ -952,7 +1028,7 @@ impl InitiatorCerts {
 /// 16 bytes are the forward encryption key. The next 16 bytes are the backward encryption key.
 /// In total, 92 bytes of K need to be generated, which means 5 blocks in total (the last 8 bytes
 /// are discarded).
-fn tor_kdf(x: &[u8; 20], y: &[u8; 20], kh: &[u8; 20]) -> CircuitKeys {
+fn tor_kdf(x: &[u8; 20], y: &[u8; 20], kh: &[u8; 20]) -> Result<CircuitKeys, ()> {
     let mut k0: Vec<u8> = Vec::with_capacity(40);
     k0.extend(x.iter());
     k0.extend(y.iter());
@@ -962,7 +1038,7 @@ fn tor_kdf(x: &[u8; 20], y: &[u8; 20], kh: &[u8; 20]) -> CircuitKeys {
     hash.update(&[0]);
     let kh_calculated = hash.digest().bytes();
     if !constant_time_eq(&kh_calculated, kh) {
-        println!("didn't get the same kh?");
+        return Err(());
     }
 
     let mut buffer: Vec<u8> = Vec::new();
@@ -972,7 +1048,7 @@ fn tor_kdf(x: &[u8; 20], y: &[u8; 20], kh: &[u8; 20]) -> CircuitKeys {
         hash.update(&[i]);
         buffer.extend(hash.digest().bytes().iter());
     }
-    CircuitKeys::new(&buffer)
+    Ok(CircuitKeys::new(&buffer))
 }
 
 #[allow(non_snake_case)]

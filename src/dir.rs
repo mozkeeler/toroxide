@@ -1,15 +1,73 @@
+use base64;
 use rand::{thread_rng, Rng};
 use sha2::{Digest, Sha256};
-use std::iter::FromIterator;
 use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::iter::FromIterator;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
-use base64;
+
+use Circuit;
+use RsaSignerImpl;
+use RsaVerifierImpl;
+use TlsImpl;
 
 use util;
 
 pub trait Fetch {
     fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()>;
+}
+
+pub struct CircuitDirectoryFetcher<'a, T: 'a, V: 'a, S: 'a>
+where
+    T: TlsImpl + Read + Write,
+    V: RsaVerifierImpl,
+    S: RsaSignerImpl,
+{
+    circuit: &'a mut Circuit<T, V, S>,
+}
+
+impl<'a, T: 'a, V: 'a, S: 'a> CircuitDirectoryFetcher<'a, T, V, S>
+where
+    T: TlsImpl + Read + Write,
+    V: RsaVerifierImpl,
+    S: RsaSignerImpl,
+{
+    pub fn new(circuit: &'a mut Circuit<T, V, S>) -> CircuitDirectoryFetcher<'a, T, V, S> {
+        CircuitDirectoryFetcher { circuit: circuit }
+    }
+}
+
+impl<'a, T, V, S> Fetch for CircuitDirectoryFetcher<'a, T, V, S>
+where
+    T: TlsImpl + Read + Write,
+    V: RsaVerifierImpl,
+    S: RsaSignerImpl,
+{
+    fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()> {
+        let stream_id = self.circuit.begin_dir()?;
+        // uri will be of the form 'http://<host:port>/some/path/.../' - we just want the
+        // '/some/path/.../' part.
+        let path_parts = uri.split('/').skip(3);
+        let mut path = String::new();
+        for part in path_parts {
+            path.push('/');
+            path.push_str(part);
+        }
+        let request = format!("GET {} HTTP/1.0\r\n\r\n", path);
+        self.circuit.send(stream_id, request.as_bytes())?;
+        // This will be an HTTP response like "HTTP/1.0 200 OK..." - we just want the body.
+        let response = self.circuit.recv_to_end()?;
+        let as_string = match String::from_utf8(response) {
+            Ok(as_string) => as_string,
+            Err(_) => return Err(()),
+        };
+        let index = match as_string.find("\r\n\r\n") {
+            Some(index) => index,
+            None => return Err(()),
+        };
+        Ok(as_string[index + 4..].as_bytes().to_owned())
+    }
 }
 
 #[derive(Debug)]

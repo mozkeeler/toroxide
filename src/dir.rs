@@ -1,65 +1,15 @@
-use curl::easy::Easy;
-use curl::Error;
 use rand::{thread_rng, Rng};
 use sha2::{Digest, Sha256};
 use std::iter::FromIterator;
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::Ipv4Addr;
 use std::str::FromStr;
-use std::option;
-use std::io;
 use base64;
 
 use util;
 
 pub trait Fetch {
     fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()>;
-}
-
-// eventually we'll want to know *where* to get the peers from
-// also async? also we're not even going to do this in the long run (we'll need some sort of
-// get-this-using-your-own-http-client API or whatever)
-fn do_get(uri: &str) -> Result<Vec<u8>, Error> {
-    let mut data = Vec::new();
-    let mut handle = Easy::new();
-    handle.url(uri)?;
-    {
-        // Ok this is for sure poor API design, though.
-        let mut transfer = handle.transfer();
-        transfer.write_function(|new_data| {
-            data.extend_from_slice(new_data);
-            Ok(new_data.len())
-        })?;
-        transfer.perform()?;
-    }
-    Ok(data)
-}
-
-struct EasyFetcher {}
-
-impl Fetch for EasyFetcher {
-    fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()> {
-        match do_get(uri) {
-            Ok(bytes) => Ok(bytes),
-            Err(_) => Err(()),
-        }
-    }
-}
-
-pub fn get_tor_peers(hostport: &str) -> Result<TorPeerList, ()> {
-    let uri = format!(
-        "http://{}/tor/status-vote/current/consensus-microdesc/",
-        hostport
-    );
-    let data = match do_get(&uri) {
-        Ok(data) => data,
-        Err(_) => return Err(()),
-    };
-    let as_string = match String::from_utf8(data) {
-        Ok(as_string) => as_string,
-        Err(_) => return Err(()),
-    };
-    Ok(TorPeerList::new(hostport, PreTorPeer::parse_all(as_string)))
 }
 
 #[derive(Debug)]
@@ -69,14 +19,14 @@ pub struct TorPeerList {
 }
 
 impl TorPeerList {
-    fn new(hostport: &str, peer_list: Vec<PreTorPeer>) -> TorPeerList {
+    pub fn new(hostport: &str, consensus: &str) -> TorPeerList {
         TorPeerList {
             hostport: hostport.to_owned(),
-            peers: HashSet::from_iter(peer_list),
+            peers: HashSet::from_iter(PreTorPeer::parse_all(consensus)),
         }
     }
 
-    pub fn get_guard_node(&self) -> Option<TorPeer> {
+    pub fn get_guard_node<F: Fetch>(&self, fetcher: &mut F) -> Option<TorPeer> {
         let candidates = self.peers
             .iter()
             .filter(|node| node.is_usable && node.is_guard);
@@ -85,7 +35,7 @@ impl TorPeerList {
             Some(node) => node,
             None => return None,
         };
-        match node.to_tor_peer(&self.hostport, &mut EasyFetcher {}) {
+        match node.to_tor_peer(&self.hostport, fetcher) {
             Ok(peer) => Some(peer),
             Err(()) => None, // retry in this case?
         }
@@ -145,7 +95,7 @@ struct PreTorPeer {
 
 impl PreTorPeer {
     // TODO: validate the signatures on the given data
-    fn parse_all(response_string: String) -> Vec<PreTorPeer> {
+    fn parse_all(response_string: &str) -> Vec<PreTorPeer> {
         let mut microdescs = Vec::new();
         let mut router_line: Option<&str> = None;
         let mut mdesc_line: Option<&str> = None;
@@ -291,15 +241,11 @@ impl TorPeer {
         self.ip_address.octets()
     }
 
+    pub fn get_ip_addr(&self) -> Ipv4Addr {
+        self.ip_address.clone()
+    }
+
     pub fn get_port(&self) -> u16 {
         self.port
-    }
-}
-
-impl ToSocketAddrs for TorPeer {
-    type Iter = option::IntoIter<SocketAddr>;
-    fn to_socket_addrs(&self) -> io::Result<option::IntoIter<SocketAddr>> {
-        let addr = SocketAddr::new(IpAddr::V4(self.ip_address), self.port);
-        addr.to_socket_addrs()
     }
 }

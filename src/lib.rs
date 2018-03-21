@@ -2,26 +2,20 @@ extern crate base64;
 extern crate byteorder;
 extern crate constant_time_eq;
 extern crate crypto;
-extern crate curl;
 extern crate curve25519_dalek;
 extern crate ed25519_dalek;
-extern crate getopts;
-extern crate hex;
 extern crate hmac;
 extern crate num;
-extern crate openssl;
 extern crate rand;
 extern crate sha1;
 extern crate sha2;
 
 mod certs;
-mod dir;
+pub mod dir;
 mod keys;
-mod tls;
-mod types;
+pub mod types;
 mod util;
 
-use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use constant_time_eq::constant_time_eq;
 use crypto::{aessafe, blockmodes};
 use crypto::symmetriccipher::SynchronousStreamCipher;
@@ -31,33 +25,30 @@ use hmac::{Hmac, Mac};
 use num::PrimInt;
 use rand::{OsRng, Rand, Rng};
 use sha1::Sha1;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::env;
 use std::hash::Hash;
 use std::io::prelude::*;
-use std::net::TcpListener;
 use std::ops::Mul;
-use std::thread::spawn;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-struct Circuit {
-    /// TLS connection with the first hop in the circuit.
-    tls_connection: tls::TlsConnection,
-    /// The circuit ID for this connection.
-    circ_id: u32,
-    /// Maybe the certs parsed and validated from a peer's CERTS cell
-    responder_certs: Option<ResponderCerts>,
-    /// Sequence of CircuitKeys for each hop in this circuit.
-    circuit_keys: Vec<CircuitKeys>,
-    /// Stream IDs that have been used
-    used_stream_ids: IdTracker<u16>,
-    /// How many times we've used RELAY_EARLY.
-    relay_early_count: usize,
+pub trait TlsImpl {
+    fn get_peer_cert_hash(&self) -> Result<[u8; 32], ()>;
+    fn get_tls_secrets(&self, label: &str, context: &[u8]) -> Result<Vec<u8>, ()>;
+}
+
+pub trait RsaVerifierImpl {
+    fn verify_signature(&self, cert: &[u8], data: &[u8], signature: &[u8]) -> bool;
+    fn get_key_hash(&self, cert: &[u8]) -> [u8; 32];
+}
+
+pub trait RsaSignerImpl {
+    fn sign_data(&self, data: &[u8]) -> Vec<u8>;
+    fn get_cert_bytes(&self) -> &[u8];
 }
 
 /// Generates unique IDs.
-struct IdTracker<T>
+pub struct IdTracker<T>
 where
     T: PrimInt + Hash + Rand,
 {
@@ -69,7 +60,7 @@ impl<T> IdTracker<T>
 where
     T: PrimInt + Hash + Rand,
 {
-    fn new() -> IdTracker<T> {
+    pub fn new() -> IdTracker<T> {
         IdTracker {
             used_ids: HashSet::new(),
         }
@@ -77,7 +68,7 @@ where
 
     /// Generates a new, nonzero, random id with the highest bit set that hasn't been used before or
     /// panics.
-    fn get_new_id(&mut self) -> T {
+    pub fn get_new_id(&mut self) -> T {
         const RETRY_LIMIT: usize = 1024;
         let mut csprng: OsRng = OsRng::new().unwrap();
         let mut retries = RETRY_LIMIT;
@@ -96,264 +87,41 @@ where
     }
 }
 
-struct AesContext {
-    aes: blockmodes::CtrMode<aessafe::AesSafe128Encryptor>,
+pub struct Circuit<T, V, S>
+where
+    T: TlsImpl + Read + Write,
+    V: RsaVerifierImpl,
+    S: RsaSignerImpl,
+{
+    /// TLS connection with the first hop in the circuit.
+    tls_connection: TlsHashWrapper<T>,
+    /// Implementation of RSA signature verification.
+    rsa_verifier: V,
+    /// Implementation of RSA signature creation.
+    rsa_signer: S,
+    /// The circuit ID for this connection.
+    circ_id: u32,
+    /// Maybe the certs parsed and validated from a peer's CERTS cell
+    responder_certs: Option<ResponderCerts>,
+    /// Sequence of CircuitKeys for each hop in this circuit.
+    circuit_keys: Vec<CircuitKeys>,
+    /// Stream IDs that have been used
+    used_stream_ids: IdTracker<u16>,
+    /// How many times we've used RELAY_EARLY.
+    relay_early_count: usize,
 }
 
-impl AesContext {
-    fn new(key: &[u8]) -> AesContext {
-        let mut iv: Vec<u8> = Vec::with_capacity(16);
-        iv.resize(16, 0);
-        let key: [u8; 16] = slice_to_16_byte_array(key);
-        let aes_dec = aessafe::AesSafe128Encryptor::new(&key);
-        AesContext {
-            aes: blockmodes::CtrMode::new(aes_dec, iv),
-        }
-    }
-}
-
-struct CircuitKeys {
-    forward_digest: Sha1,
-    backward_digest: Sha1,
-    forward_key: AesContext,
-    backward_key: AesContext,
-}
-
-impl CircuitKeys {
-    fn new(k: &[u8]) -> CircuitKeys {
-        CircuitKeys {
-            forward_digest: Sha1::from(&k[0..20]),
-            backward_digest: Sha1::from(&k[20..40]),
-            forward_key: AesContext::new(&k[40..56]),
-            backward_key: AesContext::new(&k[56..72]),
-        }
-    }
-}
-
-/// Used while setting up a curcuit to fetch the directory information of the next hop.
-struct CircuitDirectoryFetcher<'a> {
-    circuit: &'a mut Circuit,
-}
-
-impl<'a> dir::Fetch for CircuitDirectoryFetcher<'a> {
-    fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()> {
-        let stream_id = self.circuit.begin_dir()?;
-        // uri will be of the form 'http://<host:port>/some/path/.../' - we just want the
-        // '/some/path/.../' part.
-        let path_parts = uri.split('/').skip(3);
-        let mut path = String::new();
-        for part in path_parts {
-            path.push('/');
-            path.push_str(part);
-        }
-        let request = format!("GET {} HTTP/1.0\r\n\r\n", path);
-        self.circuit.send(stream_id, request.as_bytes())?;
-        // This will be an HTTP response like "HTTP/1.0 200 OK..." - we just want the body.
-        let response = self.circuit.recv_to_end()?;
-        let as_string = match String::from_utf8(response) {
-            Ok(as_string) => as_string,
-            Err(_) => return Err(()),
-        };
-        let index = match as_string.find("\r\n\r\n") {
-            Some(index) => index,
-            None => return Err(()),
-        };
-        Ok(as_string[index + 4..].as_bytes().to_owned())
-    }
-}
-
-fn usage(program: &str) {
-    println!("Usage: {} <directory server>:<port> <demo|proxy>", program);
-}
-
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        usage(&args[0]);
-        return;
-    }
-    let peers = dir::get_tor_peers(&args[1]).unwrap();
-    let circ_id_tracker: IdTracker<u32> = IdTracker::new();
-
-    if args[2] == "demo" {
-        do_demo(peers, circ_id_tracker);
-    } else if args[2] == "proxy" {
-        do_proxy(peers, circ_id_tracker);
-    } else {
-        panic!("unknown command '{}'", args[2]);
-    }
-}
-
-fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
-    let listener = TcpListener::bind("127.0.0.1:1080").unwrap();
-    for stream in listener.incoming() {
-        let mut stream = stream.unwrap();
-        let mut buf: [u8; 1024] = [0; 1024];
-        stream.read(&mut buf).unwrap();
-        let mut reader = &buf[..];
-        let version = reader.read_u8().unwrap();
-        if version != 4 {
-            println!("unexpected version field {}", version);
-            continue; // TODO: respond with correct socks error message?
-        }
-        let command = reader.read_u8().unwrap();
-        if command != 1 {
-            println!("unexpected command {}", command);
-            continue; // TODO same
-        }
-        let port = reader.read_u16::<NetworkEndian>().unwrap();
-        let ip_addr = reader.read_u32::<NetworkEndian>().unwrap();
-        if ip_addr > 255 {
-            println!("unexpected invalid ip address {}", ip_addr);
-            continue;
-        }
-        let null_terminator = reader.read_u8().unwrap();
-        if null_terminator != 0 {
-            println!("expected zero-length username");
-            continue;
-        }
-        let mut str_buf: Vec<u8> = Vec::new();
-        loop {
-            let byte = reader.read_u8().unwrap();
-            if byte == 0 {
-                break;
-            }
-            str_buf.push(byte);
-        }
-        let domain = String::from_utf8(str_buf).unwrap();
-
-        let mut outbuf: [u8; 8] = [0; 8];
-        {
-            let mut writer = &mut outbuf[..];
-            writer.write_u8(0).unwrap();
-            writer.write_u8(0x5a).unwrap();
-            writer.write_u16::<NetworkEndian>(port).unwrap();
-            writer.write_u32::<NetworkEndian>(ip_addr).unwrap();
-        } // c'mon liveness detection :(
-        stream.write_all(&outbuf).unwrap();
-        let mut retries = 5;
-        let mut circuit_result = setup_new_circuit(&peers, &mut circ_id_tracker);
-        while circuit_result.is_err() && retries > 0 {
-            circuit_result = setup_new_circuit(&peers, &mut circ_id_tracker);
-            retries -= 1;
-        }
-        let mut circuit = match circuit_result {
-            Ok(circuit) => circuit,
-            Err(_) => break,
-        };
-        let dest = format!("{}:{}", domain, port);
-        let stream_id = match circuit.begin(&dest) {
-            Ok(stream_id) => stream_id,
-            Err(_) => break,
-        };
-
-        stream
-            .set_read_timeout(Some(Duration::from_millis(16)))
-            .unwrap();
-
-        let mut stop = false;
-        spawn(move || loop {
-            if stop {
-                break;
-            }
-            let mut buf: [u8; types::RELAY_PAYLOAD_LEN] = [0; types::RELAY_PAYLOAD_LEN];
-            loop {
-                let len = match stream.read(&mut buf) {
-                    Ok(len) => len,
-                    Err(_) => break,
-                };
-                circuit.send(stream_id, &buf[..len]).unwrap();
-            }
-            loop {
-                // If this returns an error, either there was nothing to read or we read invalid
-                // data ( :/ ) so just go around again...?
-                let response = match circuit.recv() {
-                    Ok(response) => response,
-                    Err(_) => break,
-                };
-                // If the response is length 0, either we got a cell of length 0 or a RELAY_END. We
-                // really need to figure out the signalling story here...
-                if response.len() == 0 {
-                    stop = true;
-                    break;
-                }
-                stream.write_all(&response).unwrap();
-            }
-        });
-    }
-}
-
-fn do_demo(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
-    let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker).unwrap();
-    let stream_id = circuit.begin("example.com:80").unwrap();
-    let request = r#"GET / HTTP/1.1
-Host: example.com
-User-Agent: toroxide/0.1.0
-Accept: text/html
-Accept-Language: en-US,en;q=0.5
-Connection: close
-
-"#;
-    circuit.send(stream_id, request.as_bytes()).unwrap();
-    let response = circuit.recv_to_end().unwrap();
-    print!("{}", String::from_utf8(response).unwrap());
-
-    let stream_id = circuit.begin("ip.seeip.org:80").unwrap();
-    let request = r#"GET / HTTP/1.1
-Host: ip.seeip.org
-User-Agent: toroxide/0.1.0
-Connection: close
-
-"#;
-    circuit.send(stream_id, request.as_bytes()).unwrap();
-    let response = circuit.recv_to_end().unwrap();
-    print!("{}", String::from_utf8(response).unwrap());
-}
-
-fn setup_new_circuit(
-    peers: &dir::TorPeerList,
-    circ_id_tracker: &mut IdTracker<u32>,
-) -> Result<Circuit, ()> {
-    let circ_id = circ_id_tracker.get_new_id();
-    let guard_node = match peers.get_guard_node() {
-        Some(node) => node,
-        None => return Err(()),
-    };
-    let mut circuit = Circuit::new(&guard_node, circ_id);
-    circuit.negotiate_versions()?;
-    circuit.read_certs(&guard_node.get_ed25519_id_key())?;
-    circuit.read_auth_challenge()?;
-    circuit.send_certs_and_authenticate_cells()?;
-    circuit.read_netinfo()?;
-    circuit.create_fast()?;
-    let interior_node = {
-        let mut fetcher = CircuitDirectoryFetcher {
-            circuit: &mut circuit,
-        };
-        match peers.get_interior_node(&[&guard_node], &mut fetcher) {
-            Some(node) => node,
-            None => return Err(()),
-        }
-    };
-    circuit.extend(&interior_node)?;
-    let exit_node = {
-        let mut fetcher = CircuitDirectoryFetcher {
-            circuit: &mut circuit,
-        };
-        match peers.get_exit_node(&[&guard_node, &interior_node], &mut fetcher) {
-            Some(node) => node,
-            None => return Err(()),
-        }
-    };
-    circuit.extend(&exit_node)?;
-    Ok(circuit)
-}
-
-impl Circuit {
-    fn new(peer: &dir::TorPeer, circ_id: u32) -> Circuit {
-        println!("attempting to connect to {:?}", peer);
+impl<T, V, S> Circuit<T, V, S>
+where
+    T: TlsImpl + Read + Write,
+    V: RsaVerifierImpl,
+    S: RsaSignerImpl,
+{
+    pub fn new(tls_impl: T, rsa_verifier: V, rsa_signer: S, circ_id: u32) -> Circuit<T, V, S> {
         Circuit {
-            tls_connection: tls::TlsConnection::new(peer),
+            tls_connection: TlsHashWrapper::new(tls_impl),
+            rsa_verifier: rsa_verifier,
+            rsa_signer: rsa_signer,
             circ_id: circ_id,
             responder_certs: None,
             circuit_keys: Vec::new(),
@@ -362,7 +130,7 @@ impl Circuit {
         }
     }
 
-    fn negotiate_versions(&mut self) -> Result<(), ()> {
+    pub fn negotiate_versions(&mut self) -> Result<(), ()> {
         let versions = types::VersionsCell::new(vec![4]);
         let mut buf: Vec<u8> = Vec::new();
         if versions.write_to(&mut buf).is_err() {
@@ -384,7 +152,7 @@ impl Circuit {
         Ok(())
     }
 
-    fn read_certs(&mut self, expected_ed25519_id_key: &[u8; 32]) -> Result<(), ()> {
+    pub fn read_certs(&mut self, expected_ed25519_id_key: &[u8; 32]) -> Result<(), ()> {
         let cell = match types::Cell::read_new(&mut self.tls_connection) {
             Ok(cell) => cell,
             Err(_) => return Err(()),
@@ -400,11 +168,9 @@ impl Circuit {
             Ok(responder_certs) => responder_certs,
             Err(_) => return Err(()),
         };
+        let peer_cert_hash = self.tls_connection.get_peer_cert_hash()?;
         if responder_certs
-            .validate(
-                expected_ed25519_id_key,
-                self.tls_connection.get_peer_cert_hash(),
-            )
+            .validate(expected_ed25519_id_key, &peer_cert_hash, &self.rsa_verifier)
             .is_err()
         {
             return Err(());
@@ -413,7 +179,7 @@ impl Circuit {
         Ok(())
     }
 
-    fn read_auth_challenge(&mut self) -> Result<(), ()> {
+    pub fn read_auth_challenge(&mut self) -> Result<(), ()> {
         let cell = match types::Cell::read_new(&mut self.tls_connection) {
             Ok(cell) => cell,
             Err(_) => return Err(()),
@@ -434,8 +200,8 @@ impl Circuit {
         Ok(())
     }
 
-    fn send_certs_and_authenticate_cells(&mut self) -> Result<(), ()> {
-        let initiator_certs = InitiatorCerts::new();
+    pub fn send_certs_and_authenticate_cells(&mut self) -> Result<(), ()> {
+        let initiator_certs = InitiatorCerts::new(&self.rsa_signer);
         let certs_cell = initiator_certs.to_certs_cell();
         let mut buf: Vec<u8> = Vec::new();
         if certs_cell.write_to(&mut buf).is_err() {
@@ -473,21 +239,17 @@ impl Circuit {
         // "AUTH0003"
         let mut buf: Vec<u8> = b"AUTH0003".to_vec();
         // CID
-        let cid = initiator_certs
-            .rsa_identity_cert
-            .get_key()
-            .get_sha256_hash();
+        let cid = self.rsa_verifier
+            .get_key_hash(&initiator_certs.rsa_identity_cert.get_bytes());
         buf.extend(&cid);
         // SID
         let responder_certs = match self.responder_certs {
             Some(ref responder_certs) => responder_certs,
             None => return Err(()),
         };
-        let sid = responder_certs
-            .rsa_identity_cert
-            .get_key()
-            .get_sha256_hash();
-        buf.extend(sid);
+        let sid = self.rsa_verifier
+            .get_key_hash(&responder_certs.rsa_identity_cert.get_bytes());
+        buf.extend(&sid);
         // CID_ED
         let cid_ed = initiator_certs.ed25519_identity_cert.get_key_bytes();
         buf.extend(cid_ed);
@@ -501,12 +263,15 @@ impl Circuit {
         let clog = self.tls_connection.get_write_digest();
         buf.extend(clog);
         // SCERT
-        let scert = self.tls_connection.get_peer_cert_hash();
-        buf.extend(scert);
+        let scert = self.tls_connection.get_peer_cert_hash()?;
+        buf.extend(&scert);
         // TLSSECRETS
         // tor-spec.txt section 4.4.1 is wrong here - the context is the sha-256 hash of the
         // initiator's RSA identity cert (in other words, CID)
-        let tlssecrets = self.tls_connection.get_tls_secrets(&cid);
+        // Get the TLSSECRETS bytes ala tor-spec.txt, section 4.4.2. (RFC5705 exporter using the
+        // label "EXPORTER FOR TOR TLS CLIENT BINDING AUTH0003", and the given context.
+        const TLS_SECRET_LABEL: &'static str = "EXPORTER FOR TOR TLS CLIENT BINDING AUTH0003";
+        let tlssecrets = self.tls_connection.get_tls_secrets(TLS_SECRET_LABEL, &cid)?;
         buf.extend(tlssecrets);
         // RAND
         let mut rand = [0; 24];
@@ -534,7 +299,7 @@ impl Circuit {
         Ok(())
     }
 
-    fn read_netinfo(&mut self) -> Result<(), ()> {
+    pub fn read_netinfo(&mut self) -> Result<(), ()> {
         let cell = match types::Cell::read_new(&mut self.tls_connection) {
             Ok(cell) => cell,
             Err(_) => return Err(()),
@@ -567,7 +332,7 @@ impl Circuit {
         Ok(())
     }
 
-    fn create_fast(&mut self) -> Result<(), ()> {
+    pub fn create_fast(&mut self) -> Result<(), ()> {
         let mut x = [0; 20];
         let mut csprng: OsRng = match OsRng::new() {
             Ok(csprng) => csprng,
@@ -681,7 +446,7 @@ impl Circuit {
         }
     }
 
-    fn extend(&mut self, node: &dir::TorPeer) -> Result<(), ()> {
+    pub fn extend(&mut self, node: &dir::TorPeer) -> Result<(), ()> {
         println!("attempting to extend to {:?}", node);
         let client_keypair = keys::Curve25519Keypair::new();
         let ntor_client_handshake = types::NtorClientHandshake::new(node, &client_keypair);
@@ -752,7 +517,7 @@ impl Circuit {
         Ok(stream_id)
     }
 
-    fn begin(&mut self, addrport: &str) -> Result<u16, ()> {
+    pub fn begin(&mut self, addrport: &str) -> Result<u16, ()> {
         let begin = types::BeginCell::new(addrport);
         println!("{:?}", begin);
         // Hmmm maybe I wouldn't have to do all this "make a cell then make a vec then write_to it"
@@ -764,7 +529,7 @@ impl Circuit {
         self.begin_common(types::RelayCommand::Begin, &begin_bytes)
     }
 
-    fn begin_dir(&mut self) -> Result<u16, ()> {
+    pub fn begin_dir(&mut self) -> Result<u16, ()> {
         let begin = types::BeginDirCell::new();
         let mut begin_bytes: Vec<u8> = Vec::new();
         if begin.write_to(&mut begin_bytes).is_err() {
@@ -773,15 +538,15 @@ impl Circuit {
         self.begin_common(types::RelayCommand::BeginDir, &begin_bytes)
     }
 
-    fn send(&mut self, stream_id: u16, data: &[u8]) -> Result<(), ()> {
+    pub fn send(&mut self, stream_id: u16, data: &[u8]) -> Result<(), ()> {
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, data, stream_id);
         self.send_cell_bytes(bytes)
     }
 
     // I think this will return an Err if there's nothing to read... (but also it'll return an Err
     // if we get invalid data, so... I need some sort of "would block" indication?
-    fn recv(&mut self) -> Result<Vec<u8>, ()> {
-        self.tls_connection.set_nonblocking();
+    pub fn recv(&mut self) -> Result<Vec<u8>, ()> {
+        //self.tls_connection.set_nonblocking();
         let mut buf = Vec::new();
         let cell = self.read_cell()?;
         println!("{:?}", cell);
@@ -798,7 +563,7 @@ impl Circuit {
         Ok(buf)
     }
 
-    fn recv_to_end(&mut self) -> Result<Vec<u8>, ()> {
+    pub fn recv_to_end(&mut self) -> Result<Vec<u8>, ()> {
         let mut buf = Vec::new();
         loop {
             let cell = self.read_cell()?;
@@ -818,66 +583,108 @@ impl Circuit {
     }
 }
 
-fn slice_to_16_byte_array(bytes: &[u8]) -> [u8; 16] {
-    let mut fixed_size: [u8; 16] = [0; 16];
-    fixed_size.copy_from_slice(&bytes);
-    fixed_size
+struct TlsHashWrapper<T: TlsImpl + Read + Write> {
+    tls_impl: T,
+    /// A running sha256 digest of all data read from the stream
+    read_log: Sha256,
+    /// A running sha256 digest of all data written to the stream
+    write_log: Sha256,
 }
 
-fn curve25519_multiply(x: &montgomery::CompressedMontgomeryU, s: &scalar::Scalar) -> [u8; 32] {
-    x.decompress().mul(s).compress().to_bytes()
+impl<T: TlsImpl + Read + Write> TlsHashWrapper<T> {
+    pub fn new(tls_impl: T) -> TlsHashWrapper<T> {
+        TlsHashWrapper {
+            tls_impl: tls_impl,
+            read_log: Sha256::new(),
+            write_log: Sha256::new(),
+        }
+    }
+
+    /// Get the sha-256 hash of all data read from the stream.
+    pub fn get_read_digest(&self) -> Vec<u8> {
+        // Clone self.read_log so calling .result() doesn't modify its state.
+        let read_log = self.read_log.clone();
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend(read_log.result().into_iter());
+        bytes
+    }
+
+    /// Get the sha-256 hash of all data written to the stream.
+    pub fn get_write_digest(&self) -> Vec<u8> {
+        // Clone self.write_log so calling .result() doesn't modify its state.
+        let write_log = self.write_log.clone();
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend(write_log.result().into_iter());
+        bytes
+    }
 }
 
-fn ntor_hmac(input: &[u8], context: &[u8]) -> Vec<u8> {
-    // We seem to be using a public value for a private key here - am I misunderstanding?
-    let mut mac = Hmac::<Sha256>::new(context).unwrap();
-    mac.input(input);
-    let mut bytes: Vec<u8> = Vec::new();
-    bytes.extend(mac.result().code().as_slice().iter());
-    bytes
+impl<T: TlsImpl + Read + Write> TlsImpl for TlsHashWrapper<T> {
+    fn get_peer_cert_hash(&self) -> Result<[u8; 32], ()> {
+        self.tls_impl.get_peer_cert_hash()
+    }
+
+    fn get_tls_secrets(&self, label: &str, context_key: &[u8]) -> Result<Vec<u8>, ()> {
+        self.tls_impl.get_tls_secrets(label, context_key)
+    }
 }
 
-// TODO: maybe rename this function (tor-spec.txt section 5.2.2. KDF-RFC5869)
-fn compute_ntor_keys(key_seed: &[u8]) -> CircuitKeys {
-    // We need to generate:
-    // HASH_LEN bytes (forward digest)
-    // HASH_LEN bytes (backward digest)
-    // KEY_LEN bytes (forward key)
-    // KEY_LEN bytes (backward key)
-    // HASH_LEN bytes (KH in hidden service protocol (?))
-    // where HASH_LEN is 20 bytes and KEY_LEN is 16 bytes.
-    // We're using HMAC-SHA256, so each out block is 32 bytes.
-    // We'll need 3 total blocks.
-    // m_expand = b"ntor-curve25519-sha256-1:key_expand"
-    // HMAC-SHA256(x, t): input is x, key is t
-    // K(1) = HMAC-SHA256(m_expand | 0x01 as u8, key_seed)
-    // K(2) = HMAC-SHA256(K(1) | m_expand | 0x02 as u8, key_seed)
-    // K(2) = HMAC-SHA256(K(2) | m_expand | 0x03 as u8, key_seed)
-    let mut m_expand_1: Vec<u8> = Vec::new();
-    m_expand_1
-        .write_all(b"ntor-curve25519-sha256-1:key_expand")
-        .unwrap();
-    m_expand_1.push(1);
-    let k_1 = ntor_hmac(&m_expand_1, key_seed);
-    let mut m_expand_2: Vec<u8> = Vec::new();
-    m_expand_2.write_all(&k_1).unwrap();
-    m_expand_2
-        .write_all(b"ntor-curve25519-sha256-1:key_expand")
-        .unwrap();
-    m_expand_2.push(2);
-    let k_2 = ntor_hmac(&m_expand_2, key_seed);
-    let mut m_expand_3: Vec<u8> = Vec::new();
-    m_expand_3.write_all(&k_2).unwrap();
-    m_expand_3
-        .write_all(b"ntor-curve25519-sha256-1:key_expand")
-        .unwrap();
-    m_expand_3.push(3);
-    let k_3 = ntor_hmac(&m_expand_3, key_seed);
-    let mut k: Vec<u8> = Vec::new();
-    k.write_all(&k_1).unwrap();
-    k.write_all(&k_2).unwrap();
-    k.write_all(&k_3).unwrap();
-    CircuitKeys::new(&k)
+impl<T: TlsImpl + Read + Write> Read for TlsHashWrapper<T> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        let result = self.tls_impl.read(buf);
+        if let &Ok(len) = &result {
+            self.read_log.input(&buf[..len]);
+        }
+        result
+    }
+}
+
+impl<T: TlsImpl + Read + Write> Write for TlsHashWrapper<T> {
+    fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
+        let result = self.tls_impl.write(data);
+        if let &Ok(len) = &result {
+            self.write_log.input(&data[..len]);
+        }
+        result
+    }
+
+    fn flush(&mut self) -> Result<(), std::io::Error> {
+        self.tls_impl.flush()
+    }
+}
+
+struct AesContext {
+    aes: blockmodes::CtrMode<aessafe::AesSafe128Encryptor>,
+}
+
+impl AesContext {
+    fn new(key: &[u8]) -> AesContext {
+        let mut iv: Vec<u8> = Vec::with_capacity(16);
+        iv.resize(16, 0);
+        let key: [u8; 16] = slice_to_16_byte_array(key);
+        let aes_dec = aessafe::AesSafe128Encryptor::new(&key);
+        AesContext {
+            aes: blockmodes::CtrMode::new(aes_dec, iv),
+        }
+    }
+}
+
+struct CircuitKeys {
+    forward_digest: Sha1,
+    // backward_digest: Sha1, TODO: use this
+    forward_key: AesContext,
+    backward_key: AesContext,
+}
+
+impl CircuitKeys {
+    fn new(k: &[u8]) -> CircuitKeys {
+        CircuitKeys {
+            forward_digest: Sha1::from(&k[0..20]),
+            // backward_digest: Sha1::from(&k[20..40]),
+            forward_key: AesContext::new(&k[40..56]),
+            backward_key: AesContext::new(&k[56..72]),
+        }
+    }
 }
 
 /// Represents the certs that are supposed to be present in a responder's CERTS cell.
@@ -951,21 +758,27 @@ impl ResponderCerts {
     fn validate(
         &self,
         expected_ed25519_id_key: &[u8; 32],
-        peer_cert_hash: Vec<u8>,
+        peer_cert_hash: &[u8; 32],
+        rsa_verifier: &RsaVerifierImpl,
     ) -> Result<(), &'static str> {
         // Need to check:
         // rsa_identity_cert is self-signed
+        /* honestly, not sure what this protects against
         if !self.rsa_identity_cert.is_self_signed() {
             return Err("RSA identity cert is not self-signed");
         }
+        */
         // rsa identity key (in rsa_identity_cert) signed ed25519_identity_cert, is 1024 bits
-        let identity_key = self.rsa_identity_cert.get_key();
-        if !identity_key.check_ed25519_identity_signature(&self.ed25519_identity_cert) {
+        if !self.rsa_identity_cert
+            .check_ed25519_identity_signature(&self.ed25519_identity_cert, rsa_verifier)
+        {
             return Err("RSA identity cert did not sign Ed25519 identity cert");
         }
+        /*
         if identity_key.get_size_in_bits() != 1024 {
             return Err("RSA identity key wrong size");
         }
+        */
         // ed25519 identity key (in ed25519_identity_cert) signed ed25519_signing_cert
         let ed25519_identity_key = self.ed25519_identity_cert.get_key();
         if !ed25519_identity_key.matches_expected_key(expected_ed25519_id_key) {
@@ -981,7 +794,7 @@ impl ResponderCerts {
         }
         // certified "key" in ed25519_link_cert matches sha-256 hash of TLS peer certificate
         if !self.ed25519_link_cert
-            .check_x509_certificate_hash(&peer_cert_hash)
+            .check_x509_certificate_hash(peer_cert_hash)
         {
             return Err("Ed25519 link key does not match peer certificate");
         }
@@ -1000,15 +813,13 @@ struct InitiatorCerts {
 }
 
 impl InitiatorCerts {
-    fn new() -> InitiatorCerts {
+    fn new(rsa_signer: &RsaSignerImpl) -> InitiatorCerts {
         // Apparently we don't need to keep this around for now.
-        let rsa_identity_key = keys::RsaPrivateKey::new(1024).unwrap();
-        let rsa_identity_cert = rsa_identity_key.generate_self_signed_cert().unwrap();
+        let rsa_identity_cert = certs::X509Cert::new(rsa_signer.get_cert_bytes());
         // Apparently we don't need to keep this around for now.
         let ed25519_identity_key = keys::Ed25519Key::new();
-        let ed25519_identity_cert = rsa_identity_key
-            .sign_ed25519_key(&ed25519_identity_key)
-            .unwrap();
+        let ed25519_identity_cert =
+            rsa_identity_cert.sign_ed25519_key(&ed25519_identity_key, rsa_signer);
         // Apparently we don't need to keep this around for now.
         let ed25519_signing_key = keys::Ed25519Key::new();
         let ed25519_signing_cert = ed25519_identity_key
@@ -1135,4 +946,66 @@ fn ntor_handshake(
     } else {
         Err(())
     }
+}
+
+fn slice_to_16_byte_array(bytes: &[u8]) -> [u8; 16] {
+    let mut fixed_size: [u8; 16] = [0; 16];
+    fixed_size.copy_from_slice(&bytes);
+    fixed_size
+}
+
+fn curve25519_multiply(x: &montgomery::CompressedMontgomeryU, s: &scalar::Scalar) -> [u8; 32] {
+    x.decompress().mul(s).compress().to_bytes()
+}
+
+fn ntor_hmac(input: &[u8], context: &[u8]) -> Vec<u8> {
+    // We seem to be using a public value for a private key here - am I misunderstanding?
+    let mut mac = Hmac::<Sha256>::new(context).unwrap();
+    mac.input(input);
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend(mac.result().code().as_slice().iter());
+    bytes
+}
+
+// TODO: maybe rename this function (tor-spec.txt section 5.2.2. KDF-RFC5869)
+fn compute_ntor_keys(key_seed: &[u8]) -> CircuitKeys {
+    // We need to generate:
+    // HASH_LEN bytes (forward digest)
+    // HASH_LEN bytes (backward digest)
+    // KEY_LEN bytes (forward key)
+    // KEY_LEN bytes (backward key)
+    // HASH_LEN bytes (KH in hidden service protocol (?))
+    // where HASH_LEN is 20 bytes and KEY_LEN is 16 bytes.
+    // We're using HMAC-SHA256, so each out block is 32 bytes.
+    // We'll need 3 total blocks.
+    // m_expand = b"ntor-curve25519-sha256-1:key_expand"
+    // HMAC-SHA256(x, t): input is x, key is t
+    // K(1) = HMAC-SHA256(m_expand | 0x01 as u8, key_seed)
+    // K(2) = HMAC-SHA256(K(1) | m_expand | 0x02 as u8, key_seed)
+    // K(2) = HMAC-SHA256(K(2) | m_expand | 0x03 as u8, key_seed)
+    let mut m_expand_1: Vec<u8> = Vec::new();
+    m_expand_1
+        .write_all(b"ntor-curve25519-sha256-1:key_expand")
+        .unwrap();
+    m_expand_1.push(1);
+    let k_1 = ntor_hmac(&m_expand_1, key_seed);
+    let mut m_expand_2: Vec<u8> = Vec::new();
+    m_expand_2.write_all(&k_1).unwrap();
+    m_expand_2
+        .write_all(b"ntor-curve25519-sha256-1:key_expand")
+        .unwrap();
+    m_expand_2.push(2);
+    let k_2 = ntor_hmac(&m_expand_2, key_seed);
+    let mut m_expand_3: Vec<u8> = Vec::new();
+    m_expand_3.write_all(&k_2).unwrap();
+    m_expand_3
+        .write_all(b"ntor-curve25519-sha256-1:key_expand")
+        .unwrap();
+    m_expand_3.push(3);
+    let k_3 = ntor_hmac(&m_expand_3, key_seed);
+    let mut k: Vec<u8> = Vec::new();
+    k.write_all(&k_1).unwrap();
+    k.write_all(&k_2).unwrap();
+    k.write_all(&k_3).unwrap();
+    CircuitKeys::new(&k)
 }

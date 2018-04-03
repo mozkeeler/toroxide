@@ -28,13 +28,14 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::hash::Hash;
+use std::io::{Cursor, Error, ErrorKind, Seek, SeekFrom};
 use std::io::prelude::*;
 use std::ops::Mul;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub trait TlsImpl {
-    fn get_peer_cert_hash(&self) -> Result<[u8; 32], ()>;
-    fn get_tls_secrets(&self, label: &str, context: &[u8]) -> Result<Vec<u8>, ()>;
+    fn get_peer_cert_hash(&self) -> Result<[u8; 32], Error>;
+    fn get_tls_secrets(&self, label: &str, context: &[u8]) -> Result<Vec<u8>, Error>;
 }
 
 pub trait RsaVerifierImpl {
@@ -87,131 +88,323 @@ where
     }
 }
 
-pub struct Circuit<T, V, S>
+#[derive(Debug)]
+enum CircuitState {
+    NegotiateWriting,
+    NegotiateReading,
+    CertsReading,
+    AuthChallengeReading,
+    CertsWriting,
+    AuthenticateWriting,
+    NetinfoReading,
+    NetinfoWriting,
+    CreateFastWriting,
+    CreateFastReading,
+    Ready,
+    Error,
+}
+
+#[derive(Debug)]
+pub enum Async<T> {
+    Ready(T),
+    NotReady,
+}
+
+pub struct Circuit<T, V>
 where
     T: TlsImpl + Read + Write,
     V: RsaVerifierImpl,
-    S: RsaSignerImpl,
 {
+    /// Current state of the curcuit.
+    state: CircuitState,
     /// TLS connection with the first hop in the circuit.
     tls_connection: TlsHashWrapper<T>,
     /// Implementation of RSA signature verification.
     rsa_verifier: V,
-    /// Implementation of RSA signature creation.
-    rsa_signer: S,
+    /// Initiator keys for this circuit (TODO: should these be re-used across circuits?)
+    initiator_certs: InitiatorCerts,
     /// The circuit ID for this connection.
     circ_id: u32,
+    /// The expected Ed25519 identity key from the peer.
+    expected_ed25519_id_key: [u8; 32],
     /// Maybe the certs parsed and validated from a peer's CERTS cell
     responder_certs: Option<ResponderCerts>,
+    /// Maybe the peer's OR address
+    other_or_address: Option<types::OrAddress>,
+    /// 20 byte random value for Tor KDF
+    x: [u8; 20],
     /// Sequence of CircuitKeys for each hop in this circuit.
     circuit_keys: Vec<CircuitKeys>,
     /// Stream IDs that have been used
     used_stream_ids: IdTracker<u16>,
     /// How many times we've used RELAY_EARLY.
     relay_early_count: usize,
+    /// Internal read buffer for when some data is available from the peer but not enough to
+    /// complete the operation we're doing.
+    buffer: Cursor<Vec<u8>>,
 }
 
-impl<T, V, S> Circuit<T, V, S>
+impl<T, V> Circuit<T, V>
 where
     T: TlsImpl + Read + Write,
     V: RsaVerifierImpl,
-    S: RsaSignerImpl,
 {
-    pub fn new(tls_impl: T, rsa_verifier: V, rsa_signer: S, circ_id: u32) -> Circuit<T, V, S> {
+    pub fn new(
+        tls_impl: T,
+        rsa_verifier: V,
+        rsa_signer: &RsaSignerImpl,
+        circ_id: u32,
+        expected_ed25519_id_key: [u8; 32],
+    ) -> Circuit<T, V> {
         Circuit {
+            state: CircuitState::NegotiateWriting,
             tls_connection: TlsHashWrapper::new(tls_impl),
-            rsa_verifier: rsa_verifier,
-            rsa_signer: rsa_signer,
-            circ_id: circ_id,
+            rsa_verifier,
+            initiator_certs: InitiatorCerts::new(rsa_signer),
+            circ_id,
+            expected_ed25519_id_key,
             responder_certs: None,
+            other_or_address: None,
+            // This gets filled in in `do_create_fast_write`.
+            x: [0; 20],
             circuit_keys: Vec::new(),
             used_stream_ids: IdTracker::new(),
             relay_early_count: 0,
+            buffer: Cursor::new(Vec::new()),
         }
     }
 
-    pub fn negotiate_versions(&mut self) -> Result<(), ()> {
+    pub fn poll(&mut self) -> Result<Async<()>, Error> {
+        println!("Circuit::poll({:?})", self.state);
+        let result = match self.state {
+            CircuitState::NegotiateWriting => self.do_negotiate_write(),
+            CircuitState::NegotiateReading => self.do_negotiate_read(),
+            CircuitState::CertsReading => self.do_certs_read(),
+            CircuitState::AuthChallengeReading => self.do_auth_challenge_read(),
+            CircuitState::CertsWriting => self.do_certs_write(),
+            CircuitState::AuthenticateWriting => self.do_authenticate_write(),
+            CircuitState::NetinfoReading => self.do_netinfo_read(),
+            CircuitState::NetinfoWriting => self.do_netinfo_write(),
+            CircuitState::CreateFastWriting => self.do_create_fast_write(),
+            CircuitState::CreateFastReading => self.do_create_fast_read(),
+            CircuitState::Ready => return Ok(Async::Ready(())),
+            _ => Err(Error::new(ErrorKind::Other, "unimplemented")),
+        };
+        if result.is_err() {
+            self.state = CircuitState::Error;
+            return result;
+        }
+        Ok(Async::NotReady)
+    }
+
+    /// Attempt to read as much as possible from `self.tls_connection`, appending to the local
+    /// buffer. After doing so, if there is no data available in the read buffer, returns
+    /// `Ok(Async::NotReady)`.
+    fn read_to_buffer(&mut self) -> Result<Async<()>, Error> {
+        // Most packets we're reading will be ~514 bytes, but the CERTS cell can be much larger, so
+        // we read as much as we can in 514-byte chunks.
+        loop {
+            let mut tmp = Vec::with_capacity(514);
+            tmp.resize(514, 0);
+            let bytes_read = match self.tls_connection.read(&mut tmp) {
+                Ok(n) => {
+                    if n == 0 {
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "peer closed connection?",
+                        ));
+                    }
+                    n
+                }
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    return Err(e);
+                }
+            };
+            // We read and write from/to different parts of the `Cursor`, so we have to save the
+            // read position here.
+            let read_position = self.buffer.position();
+            self.buffer.seek(SeekFrom::End(0))?;
+            self.buffer.write_all(&tmp[..bytes_read])?;
+            self.buffer.set_position(read_position);
+        }
+        // Find out if there's any data past the read position.
+        let read_position = self.buffer.position();
+        self.buffer.seek(SeekFrom::End(0))?;
+        let has_data = read_position != self.buffer.position();
+        self.buffer.set_position(read_position);
+        if has_data {
+            Ok(Async::Ready(()))
+        } else {
+            Ok(Async::NotReady)
+        }
+    }
+
+    fn do_negotiate_write(&mut self) -> Result<Async<()>, Error> {
         let versions = types::VersionsCell::new(vec![4]);
         let mut buf: Vec<u8> = Vec::new();
-        if versions.write_to(&mut buf).is_err() {
-            return Err(());
+        if let Err(e) = versions.write_to(&mut buf) {
+            return Err(e);
         }
-        match self.tls_connection.write(&buf) {
-            Ok(_) => {}
-            Err(_) => return Err(()),
-        };
-        let peer_versions = match types::VersionsCell::read_new(&mut self.tls_connection) {
-            Ok(peer_versions) => peer_versions,
-            Err(_) => return Err(()),
-        };
-        let version = match versions.negotiate(&peer_versions) {
-            Ok(version) => version,
-            Err(_) => return Err(()),
-        };
-        println!("negotiated version {}", version);
-        Ok(())
+        match self.tls_connection.write_all(&buf) {
+            Ok(_) => {
+                self.state = CircuitState::NegotiateReading;
+                Ok(Async::Ready(()))
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(Async::NotReady),
+            Err(e) => Err(e),
+        }
     }
 
-    pub fn read_certs(&mut self, expected_ed25519_id_key: &[u8; 32]) -> Result<(), ()> {
-        let cell = match types::Cell::read_new(&mut self.tls_connection) {
+    fn do_negotiate_read(&mut self) -> Result<Async<()>, Error> {
+        match self.read_to_buffer()? {
+            Async::Ready(()) => {}
+            Async::NotReady => return Ok(Async::NotReady),
+        }
+        // Save the read position in case we don't have enough data to decode the cell we want to
+        // read (in which case we'll re-set the position to the saved value and return
+        // `Ok(Async::NotReady)`).
+        let saved_position = self.buffer.position();
+        let peer_versions = match types::VersionsCell::read_new(&mut self.buffer) {
+            Ok(peer_versions) => peer_versions,
+            // TODO: differentiate between EOF (i.e. need to read more) and error decoding due to
+            // bad data.
+            Err(_) => {
+                self.buffer.set_position(saved_position);
+                return Ok(Async::NotReady);
+            }
+        };
+        // TODO: a not-great thing is we have to re-create the `versions` we created in
+        // `do_negotiate_write` - maybe make it essentially a constant?
+        let versions = types::VersionsCell::new(vec![4]);
+        let version = match versions.negotiate(&peer_versions) {
+            Ok(version) => version,
+            Err(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "couldn't negotiate version",
+                ))
+            }
+        };
+        println!("negotiated version {}", version);
+        self.state = CircuitState::CertsReading;
+        Ok(Async::Ready(()))
+    }
+
+    fn do_certs_read(&mut self) -> Result<Async<()>, Error> {
+        match self.read_to_buffer()? {
+            Async::Ready(()) => {}
+            Async::NotReady => return Ok(Async::NotReady),
+        }
+        let saved_position = self.buffer.position();
+        let cell = match types::Cell::read_new(&mut self.buffer) {
             Ok(cell) => cell,
-            Err(_) => return Err(()),
+            Err(_) => {
+                self.buffer.set_position(saved_position);
+                return Ok(Async::NotReady);
+            }
         };
         if cell.command != types::Command::Certs {
-            return Err(());
+            return Err(Error::new(ErrorKind::InvalidInput, "unexpected cell type"));
         }
         let certs_cell = match types::CertsCell::read_new(&mut &cell.payload[..]) {
             Ok(certs_cell) => certs_cell,
-            Err(_) => return Err(()),
+            Err(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "error decoding CERTS cell",
+                ))
+            }
         };
         let responder_certs = match ResponderCerts::new(certs_cell.decode_certs()) {
             Ok(responder_certs) => responder_certs,
-            Err(_) => return Err(()),
+            Err(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "error decoding certs in CERTS cell",
+                ))
+            }
         };
-        let peer_cert_hash = self.tls_connection.get_peer_cert_hash()?;
-        if responder_certs
-            .validate(expected_ed25519_id_key, &peer_cert_hash, &self.rsa_verifier)
-            .is_err()
-        {
-            return Err(());
+        let peer_cert_hash = match self.tls_connection.get_peer_cert_hash() {
+            Ok(peer_cert_hash) => peer_cert_hash,
+            Err(e) => return Err(e),
+        };
+        // TODO map_err I think
+        if let Err(e) = responder_certs.validate(
+            &self.expected_ed25519_id_key,
+            &peer_cert_hash,
+            &self.rsa_verifier,
+        ) {
+            return Err(Error::new(ErrorKind::Other, e));
         }
         self.responder_certs = Some(responder_certs);
-        Ok(())
+        self.state = CircuitState::AuthChallengeReading;
+        Ok(Async::Ready(()))
     }
 
-    pub fn read_auth_challenge(&mut self) -> Result<(), ()> {
-        let cell = match types::Cell::read_new(&mut self.tls_connection) {
+    fn do_auth_challenge_read(&mut self) -> Result<Async<()>, Error> {
+        match self.read_to_buffer()? {
+            Async::Ready(()) => {}
+            Async::NotReady => return Ok(Async::NotReady),
+        }
+        let saved_position = self.buffer.position();
+        let cell = match types::Cell::read_new(&mut self.buffer) {
             Ok(cell) => cell,
-            Err(_) => return Err(()),
+            Err(_) => {
+                self.buffer.set_position(saved_position);
+                return Ok(Async::NotReady);
+            }
         };
         if cell.command != types::Command::AuthChallenge {
-            return Err(());
+            return Err(Error::new(ErrorKind::InvalidInput, "unexpected cell type"));
         }
         let auth_challenge = match types::AuthChallengeCell::read_new(&mut &cell.payload[..]) {
             Ok(auth_challenge_cell) => auth_challenge_cell,
-            Err(_) => return Err(()),
+            Err(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "error decoding AUTH CHALLENGE cell",
+                ))
+            }
         };
         println!("{:?}", auth_challenge);
         if !auth_challenge.has_auth_type(types::AuthType::Ed25519Sha256Rfc5705) {
-            return Err(());
+            return Err(Error::new(ErrorKind::InvalidInput, "unsupported auth type"));
         }
         // It seems we don't actually have to do anything else here, since the only thing we would
         // need is actually in our connection's read digest.
-        Ok(())
+        self.state = CircuitState::CertsWriting;
+        Ok(Async::Ready(()))
     }
 
-    pub fn send_certs_and_authenticate_cells(&mut self) -> Result<(), ()> {
-        let initiator_certs = InitiatorCerts::new(&self.rsa_signer);
-        let certs_cell = initiator_certs.to_certs_cell();
+    fn do_certs_write(&mut self) -> Result<Async<()>, Error> {
+        let certs_cell = self.initiator_certs.to_certs_cell();
         let mut buf: Vec<u8> = Vec::new();
         if certs_cell.write_to(&mut buf).is_err() {
-            return Err(());
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "couldn't serialize CERTS cell",
+            ));
         }
         let cell = types::Cell::new(0, types::Command::Certs, buf);
-        if cell.write_to(&mut self.tls_connection).is_err() {
-            return Err(());
-        };
+        let mut buf: Vec<u8> = Vec::new();
+        if cell.write_to(&mut buf).is_err() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "couldn't serialize cell",
+            ));
+        }
+        match self.tls_connection.write_all(&buf) {
+            Ok(_) => {
+                self.state = CircuitState::AuthenticateWriting;
+                Ok(Async::Ready(()))
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(Async::NotReady),
+            Err(e) => Err(e),
+        }
+    }
 
+    fn do_authenticate_write(&mut self) -> Result<Async<()>, Error> {
         // tor-spec.txt section 4.4.2: With Ed25519-SHA256-RFC5705 link authentication, the
         // authentication field of the AUTHENTICATE cell is as follows:
         // "AUTH0003" [8 bytes]
@@ -240,24 +433,36 @@ where
         let mut buf: Vec<u8> = b"AUTH0003".to_vec();
         // CID
         let cid = self.rsa_verifier
-            .get_key_hash(&initiator_certs.rsa_identity_cert.get_bytes());
+            .get_key_hash(&self.initiator_certs.rsa_identity_cert.get_bytes());
         buf.extend(&cid);
         // SID
         let responder_certs = match self.responder_certs {
             Some(ref responder_certs) => responder_certs,
-            None => return Err(()),
+            None => return Err(Error::new(ErrorKind::Other, "`responder_certs` not set?")),
         };
         let sid = self.rsa_verifier
             .get_key_hash(&responder_certs.rsa_identity_cert.get_bytes());
         buf.extend(&sid);
         // CID_ED
-        let cid_ed = initiator_certs.ed25519_identity_cert.get_key_bytes();
+        let cid_ed = self.initiator_certs.ed25519_identity_cert.get_key_bytes();
         buf.extend(cid_ed);
         // SID_ED
         let sid_ed = responder_certs.ed25519_identity_cert.get_key_bytes();
         buf.extend(sid_ed);
         // SLOG (yes, the responder is first this time. don't know why)
-        let slog = self.tls_connection.get_read_digest();
+        // For CLOG, our `TlsHashWrapper` intercepts all written bytes and keeps track of the
+        // running hash. This doesn't work with SLOG, because we read as much as we can until the
+        // stream blocks, which means the hash covers more data than we've actually processed, and
+        // we'll get the wrong result here.
+        let mut hash = Sha256::new();
+        let read_position = self.buffer.position();
+        let mut hash_buf = Vec::with_capacity(read_position as usize);
+        hash_buf.resize(read_position as usize, 0);
+        self.buffer.seek(SeekFrom::Start(0))?;
+        self.buffer.read(&mut hash_buf)?;
+        hash.input(&hash_buf);
+        let mut slog = Vec::new();
+        slog.extend(hash.result().into_iter());
         buf.extend(slog);
         // CLOG
         let clog = self.tls_connection.get_write_digest();
@@ -277,12 +482,12 @@ where
         let mut rand = [0; 24];
         let mut csprng: OsRng = match OsRng::new() {
             Ok(csprng) => csprng,
-            Err(_) => return Err(()),
+            Err(e) => return Err(Error::new(ErrorKind::Other, e)),
         };
         csprng.fill_bytes(&mut rand);
         buf.extend(rand.iter());
         // SIG
-        let ed25519_authenticate_key = initiator_certs.get_ed25519_authenticate_key();
+        let ed25519_authenticate_key = self.initiator_certs.get_ed25519_authenticate_key();
         let signature = ed25519_authenticate_key.sign_data(&buf);
         buf.extend(signature.iter());
 
@@ -290,85 +495,150 @@ where
             types::AuthenticateCell::new(types::AuthType::Ed25519Sha256Rfc5705, buf);
         let mut buf: Vec<u8> = Vec::new();
         if authenticate_cell.write_to(&mut buf).is_err() {
-            return Err(());
+            return Err(Error::new(
+                ErrorKind::Other,
+                "couldn't serialize AUTHENTICATE cell",
+            ));
         }
         let cell = types::Cell::new(0, types::Command::Authenticate, buf);
-        if cell.write_to(&mut self.tls_connection).is_err() {
-            return Err(());
+        let mut buf: Vec<u8> = Vec::new();
+        if cell.write_to(&mut buf).is_err() {
+            return Err(Error::new(ErrorKind::Other, "couldn't serialize cell"));
         }
-        Ok(())
+        match self.tls_connection.write_all(&buf) {
+            Ok(_) => {
+                self.state = CircuitState::NetinfoReading;
+                Ok(Async::Ready(()))
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(Async::NotReady),
+            Err(e) => Err(e),
+        }
     }
 
-    pub fn read_netinfo(&mut self) -> Result<(), ()> {
-        let cell = match types::Cell::read_new(&mut self.tls_connection) {
+    fn do_netinfo_read(&mut self) -> Result<Async<()>, Error> {
+        match self.read_to_buffer()? {
+            Async::Ready(()) => {}
+            Async::NotReady => return Ok(Async::NotReady),
+        }
+        let saved_position = self.buffer.position();
+        let cell = match types::Cell::read_new(&mut self.buffer) {
             Ok(cell) => cell,
-            Err(_) => return Err(()),
+            Err(_) => {
+                self.buffer.set_position(saved_position);
+                return Ok(Async::NotReady);
+            }
         };
         println!("{:?}", cell);
         if cell.command != types::Command::Netinfo {
-            return Err(());
+            return Err(Error::new(ErrorKind::Other, "unexpected cell type"));
         }
         let netinfo = match types::NetinfoCell::read_new(&mut &cell.payload[..]) {
             Ok(netinfo_cell) => netinfo_cell,
-            Err(_) => return Err(()),
+            Err(_) => return Err(Error::new(ErrorKind::Other, "couldn't decode NETINFO cell")),
         };
         println!("{:?}", netinfo);
+        self.other_or_address = Some(netinfo.get_other_or_address());
+        self.state = CircuitState::NetinfoWriting;
+        Ok(Async::Ready(()))
+    }
 
+    fn do_netinfo_write(&mut self) -> Result<Async<()>, Error> {
         let timestamp: types::EpochSeconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as u32;
-        let other_or_address = netinfo.get_other_or_address();
+        let other_or_address = match self.other_or_address {
+            Some(ref other_or_address) => other_or_address.clone(),
+            None => return Err(Error::new(ErrorKind::Other, "other_or_address not set?")),
+        };
         let localhost = types::OrAddress::IPv4Address([127, 0, 0, 1]);
         let netinfo = types::NetinfoCell::new(timestamp, other_or_address, localhost);
         let mut buf: Vec<u8> = Vec::new();
         if netinfo.write_to(&mut buf).is_err() {
-            return Err(());
+            return Err(Error::new(
+                ErrorKind::Other,
+                "error serializing NETINFO cell",
+            ));
         }
         let cell = types::Cell::new(0, types::Command::Netinfo, buf);
-        if cell.write_to(&mut self.tls_connection).is_err() {
-            return Err(());
+        let mut buf: Vec<u8> = Vec::new();
+        if cell.write_to(&mut buf).is_err() {
+            return Err(Error::new(ErrorKind::Other, "error serializing cell"));
         }
-        Ok(())
+        match self.tls_connection.write_all(&buf) {
+            Ok(_) => {
+                self.state = CircuitState::CreateFastWriting;
+                Ok(Async::Ready(()))
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(Async::NotReady),
+            Err(e) => Err(e),
+        }
     }
 
-    pub fn create_fast(&mut self) -> Result<(), ()> {
-        let mut x = [0; 20];
+    fn do_create_fast_write(&mut self) -> Result<Async<()>, Error> {
         let mut csprng: OsRng = match OsRng::new() {
             Ok(csprng) => csprng,
-            Err(_) => return Err(()),
+            Err(e) => return Err(Error::new(ErrorKind::Other, e)),
         };
-        csprng.fill_bytes(&mut x);
-        let create_fast_cell = types::CreateFastCell::new(x);
+        csprng.fill_bytes(&mut self.x);
+        let create_fast_cell = types::CreateFastCell::new(self.x);
         let mut buf: Vec<u8> = Vec::new();
         if create_fast_cell.write_to(&mut buf).is_err() {
-            return Err(());
+            return Err(Error::new(
+                ErrorKind::Other,
+                "couldn't serialize CREATE FAST cell",
+            ));
         }
         let cell = types::Cell::new(self.circ_id, types::Command::CreateFast, buf);
-
-        if cell.write_to(&mut self.tls_connection).is_err() {
-            return Err(());
+        let mut buf: Vec<u8> = Vec::new();
+        if cell.write_to(&mut buf).is_err() {
+            return Err(Error::new(ErrorKind::Other, "couldn't serialize cell"));
         }
-        let cell = match types::Cell::read_new(&mut self.tls_connection) {
+        match self.tls_connection.write_all(&buf) {
+            Ok(_) => {
+                self.state = CircuitState::CreateFastReading;
+                Ok(Async::Ready(()))
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(Async::NotReady),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn do_create_fast_read(&mut self) -> Result<Async<()>, Error> {
+        match self.read_to_buffer()? {
+            Async::Ready(()) => {}
+            Async::NotReady => return Ok(Async::NotReady),
+        }
+        let saved_position = self.buffer.position();
+        let cell = match types::Cell::read_new(&mut self.buffer) {
             Ok(cell) => cell,
-            Err(_) => return Err(()),
+            Err(_) => {
+                self.buffer.set_position(saved_position);
+                return Ok(Async::NotReady);
+            }
         };
         println!("{:?}", cell);
         // TODO: handle DESTROY differently here?
         if cell.command != types::Command::CreatedFast {
-            return Err(());
+            return Err(Error::new(ErrorKind::InvalidInput, "unexpected cell type"));
         }
         let created_fast = match types::CreatedFastCell::read_new(&mut &cell.payload[..]) {
             Ok(created_fast) => created_fast,
-            Err(_) => return Err(()),
+            Err(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "error decoding CREATED FAST cell",
+                ))
+            }
         };
         println!("{:?}", created_fast);
-        let circuit_keys = match tor_kdf(&x, created_fast.get_y(), created_fast.get_kh()) {
+        let circuit_keys = match tor_kdf(&self.x, created_fast.get_y(), created_fast.get_kh()) {
             Ok(circuit_keys) => circuit_keys,
-            Err(_) => return Err(()),
+            Err(_) => return Err(Error::new(ErrorKind::Other, "Tor KDF failed")),
         };
         self.circuit_keys.push(circuit_keys);
-        Ok(())
+        self.state = CircuitState::Ready;
+        Ok(Async::Ready(()))
     }
 
     // TODO: stream_id == 0 for control commands - how do we make this easy/automatic?
@@ -543,10 +813,7 @@ where
         self.send_cell_bytes(bytes)
     }
 
-    // I think this will return an Err if there's nothing to read... (but also it'll return an Err
-    // if we get invalid data, so... I need some sort of "would block" indication?
     pub fn recv(&mut self) -> Result<Vec<u8>, ()> {
-        //self.tls_connection.set_nonblocking();
         let mut buf = Vec::new();
         let cell = self.read_cell()?;
         println!("{:?}", cell);
@@ -585,9 +852,10 @@ where
 
 struct TlsHashWrapper<T: TlsImpl + Read + Write> {
     tls_impl: T,
-    /// A running sha256 digest of all data read from the stream
-    read_log: Sha256,
-    /// A running sha256 digest of all data written to the stream
+    /// A running sha256 digest of all data written to the stream (we can't do the same thing with
+    /// data read because we read as much as we can and then buffer it in the `Circuit` that owns
+    /// this `TlsHashWrapper`, which means the read hash ends up covering more data than has
+    /// actually been processed).
     write_log: Sha256,
 }
 
@@ -595,18 +863,8 @@ impl<T: TlsImpl + Read + Write> TlsHashWrapper<T> {
     pub fn new(tls_impl: T) -> TlsHashWrapper<T> {
         TlsHashWrapper {
             tls_impl: tls_impl,
-            read_log: Sha256::new(),
             write_log: Sha256::new(),
         }
-    }
-
-    /// Get the sha-256 hash of all data read from the stream.
-    pub fn get_read_digest(&self) -> Vec<u8> {
-        // Clone self.read_log so calling .result() doesn't modify its state.
-        let read_log = self.read_log.clone();
-        let mut bytes: Vec<u8> = Vec::new();
-        bytes.extend(read_log.result().into_iter());
-        bytes
     }
 
     /// Get the sha-256 hash of all data written to the stream.
@@ -620,27 +878,23 @@ impl<T: TlsImpl + Read + Write> TlsHashWrapper<T> {
 }
 
 impl<T: TlsImpl + Read + Write> TlsImpl for TlsHashWrapper<T> {
-    fn get_peer_cert_hash(&self) -> Result<[u8; 32], ()> {
+    fn get_peer_cert_hash(&self) -> Result<[u8; 32], Error> {
         self.tls_impl.get_peer_cert_hash()
     }
 
-    fn get_tls_secrets(&self, label: &str, context_key: &[u8]) -> Result<Vec<u8>, ()> {
+    fn get_tls_secrets(&self, label: &str, context_key: &[u8]) -> Result<Vec<u8>, Error> {
         self.tls_impl.get_tls_secrets(label, context_key)
     }
 }
 
 impl<T: TlsImpl + Read + Write> Read for TlsHashWrapper<T> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        let result = self.tls_impl.read(buf);
-        if let &Ok(len) = &result {
-            self.read_log.input(&buf[..len]);
-        }
-        result
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        self.tls_impl.read(buf)
     }
 }
 
 impl<T: TlsImpl + Read + Write> Write for TlsHashWrapper<T> {
-    fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
+    fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
         let result = self.tls_impl.write(data);
         if let &Ok(len) = &result {
             self.write_log.input(&data[..len]);
@@ -648,7 +902,7 @@ impl<T: TlsImpl + Read + Write> Write for TlsHashWrapper<T> {
         result
     }
 
-    fn flush(&mut self) -> Result<(), std::io::Error> {
+    fn flush(&mut self) -> Result<(), Error> {
         self.tls_impl.flush()
     }
 }

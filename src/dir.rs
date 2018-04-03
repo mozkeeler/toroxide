@@ -8,7 +8,6 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 
 use Circuit;
-use RsaSignerImpl;
 use RsaVerifierImpl;
 use TlsImpl;
 
@@ -18,31 +17,28 @@ pub trait Fetch {
     fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()>;
 }
 
-pub struct CircuitDirectoryFetcher<'a, T: 'a, V: 'a, S: 'a>
+pub struct CircuitDirectoryFetcher<'a, T: 'a, V: 'a>
 where
     T: TlsImpl + Read + Write,
     V: RsaVerifierImpl,
-    S: RsaSignerImpl,
 {
-    circuit: &'a mut Circuit<T, V, S>,
+    circuit: &'a mut Circuit<T, V>,
 }
 
-impl<'a, T: 'a, V: 'a, S: 'a> CircuitDirectoryFetcher<'a, T, V, S>
+impl<'a, T: 'a, V: 'a> CircuitDirectoryFetcher<'a, T, V>
 where
     T: TlsImpl + Read + Write,
     V: RsaVerifierImpl,
-    S: RsaSignerImpl,
 {
-    pub fn new(circuit: &'a mut Circuit<T, V, S>) -> CircuitDirectoryFetcher<'a, T, V, S> {
+    pub fn new(circuit: &'a mut Circuit<T, V>) -> CircuitDirectoryFetcher<'a, T, V> {
         CircuitDirectoryFetcher { circuit: circuit }
     }
 }
 
-impl<'a, T, V, S> Fetch for CircuitDirectoryFetcher<'a, T, V, S>
+impl<'a, T, V> Fetch for CircuitDirectoryFetcher<'a, T, V>
 where
     T: TlsImpl + Read + Write,
     V: RsaVerifierImpl,
-    S: RsaSignerImpl,
 {
     fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()> {
         let stream_id = self.circuit.begin_dir()?;

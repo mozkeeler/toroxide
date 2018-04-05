@@ -26,7 +26,7 @@ use num::PrimInt;
 use rand::{OsRng, Rand, Rng};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io::{Cursor, Error, ErrorKind, Seek, SeekFrom};
 use std::io::prelude::*;
@@ -88,7 +88,7 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum CircuitState {
     NegotiateWriting,
     NegotiateReading,
@@ -142,6 +142,8 @@ where
     /// Internal read buffer for when some data is available from the peer but not enough to
     /// complete the operation we're doing.
     buffer: Cursor<Vec<u8>>,
+    /// Map of ids to currently-open `Stream`s.
+    streams: HashMap<u16, Stream>,
 }
 
 impl<T, V> Circuit<T, V>
@@ -171,11 +173,11 @@ where
             used_stream_ids: IdTracker::new(),
             relay_early_count: 0,
             buffer: Cursor::new(Vec::new()),
+            streams: HashMap::new(),
         }
     }
 
     pub fn poll(&mut self) -> Result<Async<()>, Error> {
-        println!("Circuit::poll({:?})", self.state);
         let result = match self.state {
             CircuitState::NegotiateWriting => self.do_negotiate_write(),
             CircuitState::NegotiateReading => self.do_negotiate_read(),
@@ -188,7 +190,7 @@ where
             CircuitState::CreateFastWriting => self.do_create_fast_write(),
             CircuitState::CreateFastReading => self.do_create_fast_read(),
             CircuitState::Ready => return Ok(Async::Ready(())),
-            _ => Err(Error::new(ErrorKind::Other, "unimplemented")),
+            _ => Err(Error::new(ErrorKind::Other, "library error: invalid state")),
         };
         if result.is_err() {
             self.state = CircuitState::Error;
@@ -673,7 +675,7 @@ where
         bytes
     }
 
-    fn decrypt_cell_bytes(&mut self, in_bytes: &[u8]) -> Result<types::RelayCell, ()> {
+    fn decrypt_cell_bytes(&mut self, in_bytes: &[u8]) -> Result<types::RelayCell, Error> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(in_bytes);
         for circuit_keys in self.circuit_keys.iter_mut() {
@@ -691,31 +693,20 @@ where
         }
         match types::RelayCell::read_new(&mut &bytes[..]) {
             Ok(decrypted_cell) => Ok(decrypted_cell),
-            Err(_) => Err(()),
+            Err(_) => Err(Error::new(ErrorKind::Other, "could not decrypt RELAY cell")),
         }
     }
 
-    fn send_cell_bytes(&mut self, bytes: Vec<u8>) -> Result<(), ()> {
-        let command = if self.relay_early_count < 8 {
-            self.relay_early_count += 1;
-            types::Command::RelayEarly
-        } else {
-            types::Command::Relay
-        };
-        let cell = types::Cell::new(self.circ_id, command, bytes);
-        match cell.write_to(&mut self.tls_connection) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(()),
-        }
-    }
-
+    /*
     fn read_cell(&mut self) -> Result<types::Cell, ()> {
         match types::Cell::read_new(&mut self.tls_connection) {
             Ok(cell) => Ok(cell),
             Err(_) => Err(()),
         }
     }
+    */
 
+    /*
     pub fn extend(&mut self, node: &dir::TorPeer) -> Result<(), ()> {
         println!("attempting to extend to {:?}", node);
         let client_keypair = keys::Curve25519Keypair::new();
@@ -762,7 +753,9 @@ where
         self.circuit_keys.push(circuit_keys);
         Ok(())
     }
+    */
 
+    /*
     // returns what stream id we picked
     /// begin_command must be types::RelayCommand::RELAY_BEGIN or
     /// types::RelayCommand::RELAY_BEGIN_DIR for this to be useful
@@ -786,7 +779,9 @@ where
         }
         Ok(stream_id)
     }
+    */
 
+    /*
     pub fn begin(&mut self, addrport: &str) -> Result<u16, ()> {
         let begin = types::BeginCell::new(addrport);
         println!("{:?}", begin);
@@ -798,21 +793,172 @@ where
         }
         self.begin_common(types::RelayCommand::Begin, &begin_bytes)
     }
+    */
 
-    pub fn begin_dir(&mut self) -> Result<u16, ()> {
-        let begin = types::BeginDirCell::new();
-        let mut begin_bytes: Vec<u8> = Vec::new();
-        if begin.write_to(&mut begin_bytes).is_err() {
-            return Err(());
+    pub fn open_dir_stream(&mut self) -> u16 {
+        let stream_id = self.used_stream_ids.get_new_id();
+        let stream = Stream {
+            state: StreamState::New,
+            flavor: StreamFlavor::Dir,
+            buffer: Vec::new(),
+        };
+        self.streams.insert(stream_id, stream);
+        stream_id
+    }
+
+    pub fn poll_dir(&mut self, stream_id: u16, request: &[u8]) -> Result<Async<Vec<u8>>, Error> {
+        let mut stream = match self.streams.remove(&stream_id) {
+            Some(stream) => stream,
+            None => return Err(Error::new(ErrorKind::Other, "invalid stream_id")),
+        };
+        // TODO: any branches that return Ok(...) have to manually re-insert the stream, so that's
+        // kinda a bummer...
+        let result = match stream.state {
+            StreamState::New => {
+                stream.state = StreamState::WritingBegin;
+                let begin = types::BeginDirCell::new();
+                if begin.write_to(&mut stream.buffer).is_err() {
+                    return Err(Error::new(ErrorKind::Other, "couldn't serialize BEGIN DIR cell"));
+                }
+                let mut bytes = self.encrypt_cell_bytes(types::RelayCommand::BeginDir,
+                                                        &stream.buffer, stream_id);
+                stream.buffer.clear();
+                stream.buffer.append(&mut bytes);
+                Ok(Async::NotReady)
+            }
+            StreamState::WritingBegin => {
+                match self.send_cell_bytes(stream.buffer.clone())? {
+                    Async::Ready(()) => {
+                        stream.state = StreamState::ReadingBegan;
+                        Ok(Async::NotReady)
+                    }
+                    Async::NotReady => {
+                        Ok(Async::NotReady)
+                    }
+                }
+            }
+            StreamState::ReadingBegan => {
+                let cell = match self.poll_read_cell()? {
+                    Async::Ready(cell) => cell,
+                    Async::NotReady => {
+                        // ugh this is a bummer.
+                        self.streams.insert(stream_id, stream);
+                        return Ok(Async::NotReady);
+                    }
+                };
+                println!("{:?}", cell);
+                if cell.command != types::Command::Relay {
+                    return Err(Error::new(ErrorKind::Other, "unexpected cell type"));
+                }
+                let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
+                println!("{}", relay_cell);
+                if relay_cell.relay_command != types::RelayCommand::Connected {
+                    return Err(Error::new(ErrorKind::Other, "expected RelayCommand::Connected"));
+                }
+                // TODO: check/handle other stream ids...
+                stream.state = StreamState::WritingData;
+                let mut bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, request,
+                                                        stream_id);
+                stream.buffer.clear();
+                stream.buffer.append(&mut bytes);
+                Ok(Async::NotReady)
+            }
+            StreamState::WritingData => {
+                match self.send_cell_bytes(stream.buffer.clone())? {
+                    Async::Ready(()) => {
+                        stream.state = StreamState::ReadingData;
+                        stream.buffer.clear();
+                        Ok(Async::NotReady)
+                    }
+                    Async::NotReady => {
+                        Ok(Async::NotReady)
+                    }
+                }
+            }
+            StreamState::ReadingData => {
+                let cell = match self.poll_read_cell()? {
+                    Async::Ready(cell) => cell,
+                    Async::NotReady => {
+                        // ugh this is a bummer.
+                        self.streams.insert(stream_id, stream);
+                        return Ok(Async::NotReady);
+                    }
+                };
+                println!("{:?}", cell);
+                if cell.command != types::Command::Relay {
+                    return Err(Error::new(ErrorKind::Other, "unexpected cell type"));
+                }
+                let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
+                println!("{}", relay_cell);
+                // TODO: check/handle other stream ids...
+                match relay_cell.relay_command {
+                    types::RelayCommand::Data => {
+                        stream.buffer.extend(relay_cell.get_data());
+                        Ok(Async::NotReady)
+                    }
+                    types::RelayCommand::End => {
+                        stream.state = StreamState::Ready;
+                        Ok(Async::NotReady)
+                    }
+                    _ => return Err(Error::new(ErrorKind::Other,
+                                               "expected RelayCommand::Data or End")),
+                }
+            }
+            StreamState::Ready => {
+                stream.state = StreamState::Dead;
+                Ok(Async::Ready(stream.buffer.split_off(0)))
+            }
+            StreamState::Dead => {
+                Err(Error::new(ErrorKind::Other, "polled a dead stream?"))
+            }
+        };
+        self.streams.insert(stream_id, stream);
+        result
+    }
+
+    fn send_cell_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<Async<()>, Error> {
+        let command = if self.relay_early_count < 8 {
+            self.relay_early_count += 1;
+            types::Command::RelayEarly
+        } else {
+            types::Command::Relay
+        };
+        let cell = types::Cell::new(self.circ_id, command, bytes);
+        let mut buf: Vec<u8> = Vec::new();
+        if let Err(e) = cell.write_to(&mut buf) {
+            return Err(e);
         }
-        self.begin_common(types::RelayCommand::BeginDir, &begin_bytes)
+        match self.tls_connection.write_all(&buf) {
+            Ok(_) => {
+                Ok(Async::Ready(()))
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                println!("this is probably a bug - we need to buffer a write");
+                Ok(Async::NotReady)
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    pub fn send(&mut self, stream_id: u16, data: &[u8]) -> Result<(), ()> {
-        let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, data, stream_id);
-        self.send_cell_bytes(bytes)
+    fn poll_read_cell(&mut self) -> Result<Async<types::Cell>, Error> {
+        match self.read_to_buffer()? {
+            Async::Ready(()) => {}
+            Async::NotReady => return Ok(Async::NotReady),
+        }
+        let saved_position = self.buffer.position();
+        match types::Cell::read_new(&mut self.buffer) {
+            Ok(cell) => Ok(Async::Ready(cell)),
+            Err(_) => {
+                self.buffer.set_position(saved_position);
+                Ok(Async::NotReady)
+            }
+        }
     }
 
+    /*
     pub fn recv(&mut self) -> Result<Vec<u8>, ()> {
         let mut buf = Vec::new();
         let cell = self.read_cell()?;
@@ -829,7 +975,9 @@ where
         }
         Ok(buf)
     }
+    */
 
+    /*
     pub fn recv_to_end(&mut self) -> Result<Vec<u8>, ()> {
         let mut buf = Vec::new();
         loop {
@@ -848,6 +996,29 @@ where
         }
         Ok(buf)
     }
+    */
+}
+
+#[derive(Debug)]
+enum StreamState {
+    New,
+    WritingBegin,
+    ReadingBegan,
+    WritingData,
+    ReadingData,
+    Ready,
+    Dead,
+}
+
+enum StreamFlavor {
+    Dir,
+    Data,
+}
+
+struct Stream {
+    state: StreamState,
+    flavor: StreamFlavor ,
+    buffer: Vec<u8>,
 }
 
 struct TlsHashWrapper<T: TlsImpl + Read + Write> {

@@ -511,10 +511,10 @@ impl NetinfoCell {
 pub struct RelayCell {
     pub relay_command: RelayCommand,
     recognized: u16,
-    stream_id: u16,
+    pub stream_id: u16,
     digest: u32,
     length: u16,
-    pub data: Vec<u8>,
+    data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

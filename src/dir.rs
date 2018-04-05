@@ -2,138 +2,71 @@ use base64;
 use rand::{thread_rng, Rng};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::io::{Read, Write};
-use std::iter::FromIterator;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
-use Circuit;
-use RsaVerifierImpl;
-use TlsImpl;
-
 use util;
-
-pub trait Fetch {
-    fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()>;
-}
-
-pub struct CircuitDirectoryFetcher<'a, T: 'a, V: 'a>
-where
-    T: TlsImpl + Read + Write,
-    V: RsaVerifierImpl,
-{
-    circuit: &'a mut Circuit<T, V>,
-}
-
-impl<'a, T: 'a, V: 'a> CircuitDirectoryFetcher<'a, T, V>
-where
-    T: TlsImpl + Read + Write,
-    V: RsaVerifierImpl,
-{
-    pub fn new(circuit: &'a mut Circuit<T, V>) -> CircuitDirectoryFetcher<'a, T, V> {
-        CircuitDirectoryFetcher { circuit: circuit }
-    }
-}
-
-impl<'a, T, V> Fetch for CircuitDirectoryFetcher<'a, T, V>
-where
-    T: TlsImpl + Read + Write,
-    V: RsaVerifierImpl,
-{
-    fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()> {
-        let stream_id = self.circuit.begin_dir()?;
-        // uri will be of the form 'http://<host:port>/some/path/.../' - we just want the
-        // '/some/path/.../' part.
-        let path_parts = uri.split('/').skip(3);
-        let mut path = String::new();
-        for part in path_parts {
-            path.push('/');
-            path.push_str(part);
-        }
-        let request = format!("GET {} HTTP/1.0\r\n\r\n", path);
-        self.circuit.send(stream_id, request.as_bytes())?;
-        // This will be an HTTP response like "HTTP/1.0 200 OK..." - we just want the body.
-        let response = self.circuit.recv_to_end()?;
-        let as_string = match String::from_utf8(response) {
-            Ok(as_string) => as_string,
-            Err(_) => return Err(()),
-        };
-        let index = match as_string.find("\r\n\r\n") {
-            Some(index) => index,
-            None => return Err(()),
-        };
-        Ok(as_string[index + 4..].as_bytes().to_owned())
-    }
-}
 
 #[derive(Debug)]
 pub struct TorPeerList {
-    hostport: String,
     peers: HashSet<PreTorPeer>,
 }
 
 impl TorPeerList {
-    pub fn new(hostport: &str, consensus: &str) -> TorPeerList {
+    pub fn new(consensus: &str) -> TorPeerList {
+        let mut peers = HashSet::new();
+        let mut router_line: Option<&str> = None;
+        let mut mdesc_line: Option<&str> = None;
+        let mut flags_line: Option<&str> = None;
+        // TODO: so this doesn't protect against misordered lines... (maybe verify signature first?)
+        // (probably still want to validate the structure of the data too...)
+        for line in consensus.lines() {
+            if line.starts_with("r ") && router_line.is_none() {
+                router_line = Some(line);
+            }
+            if line.starts_with("m ") && mdesc_line.is_none() {
+                mdesc_line = Some(line);
+            }
+            if line.starts_with("s ") && flags_line.is_none() {
+                flags_line = Some(line);
+            }
+            if router_line.is_some() && mdesc_line.is_some() && flags_line.is_some() {
+                peers.insert(PreTorPeer::new(
+                    router_line.take().unwrap(),
+                    mdesc_line.take().unwrap(),
+                    flags_line.take().unwrap(),
+                ));
+            }
+        }
         TorPeerList {
-            hostport: hostport.to_owned(),
-            peers: HashSet::from_iter(PreTorPeer::parse_all(consensus)),
+            peers,
         }
     }
 
-    pub fn get_guard_node<F: Fetch>(&self, fetcher: &mut F) -> Option<TorPeer> {
+    pub fn get_guard_node(&self) -> Option<&PreTorPeer> {
         let candidates = self.peers
             .iter()
             .filter(|node| node.is_usable && node.is_guard);
-        let collected: Vec<&PreTorPeer> = candidates.collect();
-        let node = match thread_rng().choose(&collected) {
-            Some(node) => node,
-            None => return None,
-        };
-        match node.to_tor_peer(&self.hostport, fetcher) {
-            Ok(peer) => Some(peer),
-            Err(()) => None, // retry in this case?
+        let mut collected: Vec<&PreTorPeer> = candidates.collect();
+        thread_rng().shuffle(&mut collected);
+        if collected.len() > 0 {
+            Some(collected[0])
+        } else {
+            None
         }
     }
 
-    pub fn get_interior_node<F: Fetch>(
-        &self,
-        blacklist: &[&TorPeer],
-        fetcher: &mut F,
-    ) -> Option<TorPeer> {
-        let node = match self.peers
-            .iter()
-            .find(|node| node.is_usable && node.not_in(blacklist))
-        {
-            Some(node) => node,
-            None => return None,
-        };
-        match node.to_tor_peer(&self.hostport, fetcher) {
-            Ok(peer) => Some(peer),
-            Err(()) => None, // retry in this case?
-        }
+    pub fn get_interior_node(&self, blacklist: &[&PreTorPeer]) -> Option<&PreTorPeer> {
+        self.peers.iter().find(|node| node.is_usable && node.not_in(blacklist))
     }
 
-    pub fn get_exit_node<F: Fetch>(
-        &self,
-        blacklist: &[&TorPeer],
-        fetcher: &mut F,
-    ) -> Option<TorPeer> {
-        let node = match self.peers
-            .iter()
-            .find(|node| node.is_usable && node.is_exit && node.not_in(blacklist))
-        {
-            Some(node) => node.clone(),
-            None => return None,
-        };
-        match node.to_tor_peer(&self.hostport, fetcher) {
-            Ok(peer) => Some(peer),
-            Err(()) => None, // retry in this case?
-        }
+    pub fn get_exit_node(&self, blacklist: &[&PreTorPeer]) -> Option<&PreTorPeer> {
+        self.peers.iter().find(|node| node.is_usable && node.is_exit && node.not_in(blacklist))
     }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-struct PreTorPeer {
+pub struct PreTorPeer {
     /// The microdescriptor hash string as parsed out of the "m somebase64..." line.
     mdesc_hash: String,
     ip_address: Ipv4Addr,
@@ -148,35 +81,6 @@ struct PreTorPeer {
 }
 
 impl PreTorPeer {
-    // TODO: validate the signatures on the given data
-    fn parse_all(response_string: &str) -> Vec<PreTorPeer> {
-        let mut microdescs = Vec::new();
-        let mut router_line: Option<&str> = None;
-        let mut mdesc_line: Option<&str> = None;
-        let mut flags_line: Option<&str> = None;
-        // TODO: so this doesn't protect against misordered lines... (maybe verify signature first?)
-        // (probably still want to validate the structure of the data too...)
-        for line in response_string.lines() {
-            if line.starts_with("r ") && router_line.is_none() {
-                router_line = Some(line);
-            }
-            if line.starts_with("m ") && mdesc_line.is_none() {
-                mdesc_line = Some(line);
-            }
-            if line.starts_with("s ") && flags_line.is_none() {
-                flags_line = Some(line);
-            }
-            if router_line.is_some() && mdesc_line.is_some() && flags_line.is_some() {
-                microdescs.push(PreTorPeer::new(
-                    router_line.take().unwrap(),
-                    mdesc_line.take().unwrap(),
-                    flags_line.take().unwrap(),
-                ));
-            }
-        }
-        microdescs
-    }
-
     fn new(router_line: &str, m_hash_line: &str, flags_line: &str) -> PreTorPeer {
         let mut flags = flags_line.split(" ");
         let router_parts: Vec<&str> = router_line.split(" ").collect();
@@ -194,32 +98,30 @@ impl PreTorPeer {
         }
     }
 
-    // TODO: make an error type for this Result? (it doesn't leave this module, but still...)
-    fn to_tor_peer<F: Fetch>(&self, hostport: &str, fetcher: &mut F) -> Result<TorPeer, ()> {
-        let keys_uri = format!("http://{}/tor/micro/d/{}", hostport, self.mdesc_hash);
-        let keys_data = match fetcher.fetch(&keys_uri) {
-            Ok(keys_data) => keys_data,
-            Err(_) => return Err(()),
-        };
+    pub fn get_microdescriptor_uri(&self, hostport: &str) -> String {
+        format!("http://{}/tor/micro/d/{}", hostport, self.mdesc_hash)
+    }
+
+    pub fn get_microdescriptor_path(&self) -> String {
+        format!("/tor/micro/d/{}", self.mdesc_hash)
+    }
+
+    // TODO: make an error type for this Result (or just use Error)
+    pub fn to_tor_peer(&self, microdescriptor: &str) -> Result<TorPeer, ()> {
         // This is how we authenticate the returned data. The microdescriptor hash was part of the
         // signed consensus document, so if the hash of the data we get back matches that hash, then
         // the data is what went into the consensus, in theory.
-        let hashed = Sha256::digest(&keys_data);
+        let hashed = Sha256::digest(microdescriptor.as_bytes());
         let hashed_encoded = base64::encode_config(&hashed, base64::STANDARD_NO_PAD);
         if hashed_encoded != self.mdesc_hash {
             return Err(());
         }
 
-        let keys_string = match String::from_utf8(keys_data) {
-            Ok(keys_string) => keys_string,
-            Err(_) => return Err(()),
-        };
-
         let mut ntor_onion_key: [u8; 32] = [0; 32];
         let mut ed25519_id_key: [u8; 32] = [0; 32];
         let mut in_rsa_key = false;
         let mut rsa_public_key_base64 = String::new();
-        for line in keys_string.lines() {
+        for line in microdescriptor.lines() {
             if line == "-----END RSA PUBLIC KEY-----" {
                 in_rsa_key = false;
             }
@@ -250,7 +152,7 @@ impl PreTorPeer {
         })
     }
 
-    fn not_in(&self, blacklist: &[&TorPeer]) -> bool {
+    fn not_in(&self, blacklist: &[&PreTorPeer]) -> bool {
         for peer in blacklist {
             // TODO: something stronger than node_id?
             if self.node_id == peer.node_id {

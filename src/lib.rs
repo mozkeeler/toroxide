@@ -101,6 +101,8 @@ enum CircuitState {
     CreateFastWriting,
     CreateFastReading,
     Ready,
+    Extend2Writing,
+    Extended2Reading,
     Error,
 }
 
@@ -133,6 +135,8 @@ where
     other_or_address: Option<types::OrAddress>,
     /// 20 byte random value for Tor KDF
     x: [u8; 20],
+    /// Maybe Ntor client keypair for an in-progress extend.
+    ntor_keypair: Option<keys::Curve25519Keypair>,
     /// Sequence of CircuitKeys for each hop in this circuit.
     circuit_keys: Vec<CircuitKeys>,
     /// Stream IDs that have been used
@@ -142,6 +146,7 @@ where
     /// Internal read buffer for when some data is available from the peer but not enough to
     /// complete the operation we're doing.
     buffer: Cursor<Vec<u8>>,
+    write_buffer: Vec<u8>,
     /// Map of ids to currently-open `Stream`s.
     streams: HashMap<u16, Stream>,
 }
@@ -169,10 +174,12 @@ where
             other_or_address: None,
             // This gets filled in in `do_create_fast_write`.
             x: [0; 20],
+            ntor_keypair: None,
             circuit_keys: Vec::new(),
             used_stream_ids: IdTracker::new(),
             relay_early_count: 0,
             buffer: Cursor::new(Vec::new()),
+            write_buffer: Vec::new(),
             streams: HashMap::new(),
         }
     }
@@ -706,54 +713,90 @@ where
     }
     */
 
-    /*
-    pub fn extend(&mut self, node: &dir::TorPeer) -> Result<(), ()> {
-        println!("attempting to extend to {:?}", node);
-        let client_keypair = keys::Curve25519Keypair::new();
-        let ntor_client_handshake = types::NtorClientHandshake::new(node, &client_keypair);
-        let mut ntor_client_handshake_bytes = Vec::new();
-        if ntor_client_handshake
-            .write_to(&mut ntor_client_handshake_bytes)
-            .is_err()
-        {
-            return Err(());
+    // TODO: validate that there are no open streams when this happens.
+    pub fn poll_extend(&mut self, node: &dir::TorPeer) -> Result<Async<()>, Error> {
+        match self.state {
+            CircuitState::Ready => {
+                let client_keypair = keys::Curve25519Keypair::new();
+                let ntor_client_handshake = types::NtorClientHandshake::new(node, &client_keypair);
+                let mut ntor_client_handshake_bytes = Vec::new();
+                if ntor_client_handshake
+                    .write_to(&mut ntor_client_handshake_bytes)
+                    .is_err()
+                {
+                    return Err(Error::new(ErrorKind::Other,
+                                          "couldn't serialize NtorClientHandshake"));
+                }
+                let extend2 = types::Extend2Cell::new(node, ntor_client_handshake_bytes);
+                let mut extend2_bytes = Vec::new();
+                if extend2.write_to(&mut extend2_bytes).is_err() {
+                    return Err(Error::new(ErrorKind::Other, "couldn't serialize EXTEND2 cell"));
+                }
+                let bytes = self.encrypt_cell_bytes(types::RelayCommand::Extend2, &extend2_bytes,
+                                                    0);
+                self.write_buffer.clear();
+                self.write_buffer.extend(bytes);
+                self.ntor_keypair = Some(client_keypair);
+                self.state = CircuitState::Extend2Writing;
+                Ok(Async::NotReady)
+            }
+            CircuitState::Extend2Writing => {
+                let bytes = self.write_buffer.clone();
+                match self.send_cell_bytes(bytes)? {
+                    Async::Ready(()) => {
+                        self.state = CircuitState::Extended2Reading;
+                        Ok(Async::NotReady)
+                    }
+                    Async::NotReady => {
+                        Ok(Async::NotReady)
+                    }
+                }
+            }
+            CircuitState::Extended2Reading => {
+                let cell = match self.poll_read_cell()? {
+                    Async::Ready(cell) => cell,
+                    Async::NotReady => return Ok(Async::NotReady),
+                };
+                println!("{:?}", cell);
+                if cell.command != types::Command::Relay {
+                    return Err(Error::new(ErrorKind::Other, "expected Command::Relay"));
+                }
+                let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
+                println!("{}", relay_cell);
+                if relay_cell.relay_command != types::RelayCommand::Extended2 {
+                    return Err(Error::new(ErrorKind::Other, "expected RelayCommand::Extended2"));
+                }
+                // The contents of an EXTENDED2 relay cell is the same as a CREATED2 cell
+                let extended2 = match types::Created2Cell::read_new(&mut relay_cell.get_data()) {
+                    Ok(extended2) => extended2,
+                    Err(_) => return Err(Error::new(ErrorKind::Other,
+                                                    "couldn't decode EXTENDED2 cell")),
+                };
+                let client_keypair = match self.ntor_keypair.take() {
+                    Some(client_keypair) => client_keypair,
+                    None => return Err(Error::new(ErrorKind::Other,
+                                                  "library error: ntor_keypair should be Some")),
+                };
+                let circuit_keys = match ntor_handshake(
+                    &extended2,
+                    node.get_node_id(),
+                    node.get_ntor_key(),
+                    client_keypair.get_public_key_bytes(),
+                    client_keypair.get_secret_key_bytes(),
+                ) {
+                    Ok(circuit_keys) => circuit_keys,
+                    Err(_) => return Err(Error::new(ErrorKind::Other, "Ntor handshake failed")),
+                };
+                self.circuit_keys.push(circuit_keys);
+                self.state = CircuitState::Ready;
+                Ok(Async::Ready(()))
+            }
+            _ => {
+                self.state = CircuitState::Error;
+                Err(Error::new(ErrorKind::Other, "invalid state in poll_extend"))
+            }
         }
-        let extend2 = types::Extend2Cell::new(node, ntor_client_handshake_bytes);
-        let mut extend2_bytes = Vec::new();
-        if extend2.write_to(&mut extend2_bytes).is_err() {
-            return Err(());
-        }
-        let bytes = self.encrypt_cell_bytes(types::RelayCommand::Extend2, &extend2_bytes, 0);
-        self.send_cell_bytes(bytes)?;
-        let cell = self.read_cell()?;
-        println!("{:?}", cell);
-        if cell.command != types::Command::Relay {
-            return Err(());
-        }
-        let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
-        println!("{}", relay_cell);
-        if relay_cell.relay_command != types::RelayCommand::Extended2 {
-            return Err(());
-        }
-        // The contents of an EXTENDED2 relay cell is the same as a CREATED2 cell
-        let extended2 = match types::Created2Cell::read_new(&mut &relay_cell.data[..]) {
-            Ok(extended2) => extended2,
-            Err(_) => return Err(()),
-        };
-        let circuit_keys = match ntor_handshake(
-            &extended2,
-            node.get_node_id(),
-            node.get_ntor_key(),
-            client_keypair.get_public_key_bytes(),
-            client_keypair.get_secret_key_bytes(),
-        ) {
-            Ok(circuit_keys) => circuit_keys,
-            Err(_) => return Err(()),
-        };
-        self.circuit_keys.push(circuit_keys);
-        Ok(())
     }
-    */
 
     /*
     // returns what stream id we picked
@@ -916,6 +959,135 @@ where
         result
     }
 
+    // TODO: maybe put addrport/request etc. in open_stream so poll just polls?
+    pub fn open_stream(&mut self) -> u16 {
+        let stream_id = self.used_stream_ids.get_new_id();
+        let stream = Stream {
+            state: StreamState::New,
+            flavor: StreamFlavor::Data,
+            buffer: Vec::new(),
+        };
+        self.streams.insert(stream_id, stream);
+        stream_id
+    }
+
+    pub fn poll_stream(
+        &mut self,
+        stream_id: u16,
+        addrport: &str,
+        request: &[u8]
+    ) -> Result<Async<Vec<u8>>, Error> {
+        let mut stream = match self.streams.remove(&stream_id) {
+            Some(stream) => stream,
+            None => return Err(Error::new(ErrorKind::Other, "invalid stream_id")),
+        };
+        if stream.flavor != StreamFlavor::Data {
+            return Err(Error::new(ErrorKind::Other, "trying to stream data over non-data stream"));
+        }
+        // TODO: any branches that return Ok(...) have to manually re-insert the stream, so that's
+        // kinda a bummer...
+        let result = match stream.state {
+            StreamState::New => {
+                stream.state = StreamState::WritingBegin;
+                let begin = types::BeginCell::new(addrport);
+                if begin.write_to(&mut stream.buffer).is_err() {
+                    return Err(Error::new(ErrorKind::Other, "couldn't serialize BEGIN cell"));
+                }
+                let mut bytes = self.encrypt_cell_bytes(types::RelayCommand::Begin, &stream.buffer,
+                                                        stream_id);
+                stream.buffer.clear();
+                stream.buffer.append(&mut bytes);
+                Ok(Async::NotReady)
+            }
+            StreamState::WritingBegin => {
+                match self.send_cell_bytes(stream.buffer.clone())? {
+                    Async::Ready(()) => {
+                        stream.state = StreamState::ReadingBegan;
+                        Ok(Async::NotReady)
+                    }
+                    Async::NotReady => {
+                        Ok(Async::NotReady)
+                    }
+                }
+            }
+            StreamState::ReadingBegan => {
+                let cell = match self.poll_read_cell()? {
+                    Async::Ready(cell) => cell,
+                    Async::NotReady => {
+                        // ugh this is a bummer.
+                        self.streams.insert(stream_id, stream);
+                        return Ok(Async::NotReady);
+                    }
+                };
+                println!("{:?}", cell);
+                if cell.command != types::Command::Relay {
+                    return Err(Error::new(ErrorKind::Other, "unexpected cell type"));
+                }
+                let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
+                println!("{}", relay_cell);
+                if relay_cell.relay_command != types::RelayCommand::Connected {
+                    return Err(Error::new(ErrorKind::Other, "expected RelayCommand::Connected"));
+                }
+                // TODO: check/handle other stream ids...
+                stream.state = StreamState::WritingData;
+                let mut bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, request,
+                                                        stream_id);
+                stream.buffer.clear();
+                stream.buffer.append(&mut bytes);
+                Ok(Async::NotReady)
+            }
+            StreamState::WritingData => {
+                match self.send_cell_bytes(stream.buffer.clone())? {
+                    Async::Ready(()) => {
+                        stream.state = StreamState::ReadingData;
+                        stream.buffer.clear();
+                        Ok(Async::NotReady)
+                    }
+                    Async::NotReady => {
+                        Ok(Async::NotReady)
+                    }
+                }
+            }
+            StreamState::ReadingData => {
+                let cell = match self.poll_read_cell()? {
+                    Async::Ready(cell) => cell,
+                    Async::NotReady => {
+                        // ugh this is a bummer.
+                        self.streams.insert(stream_id, stream);
+                        return Ok(Async::NotReady);
+                    }
+                };
+                println!("{:?}", cell);
+                if cell.command != types::Command::Relay {
+                    return Err(Error::new(ErrorKind::Other, "unexpected cell type"));
+                }
+                let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
+                println!("{}", relay_cell);
+                // TODO: check/handle other stream ids...
+                match relay_cell.relay_command {
+                    types::RelayCommand::Data => {
+                        stream.buffer.extend(relay_cell.get_data());
+                        Ok(Async::NotReady)
+                    }
+                    types::RelayCommand::End => {
+                        stream.state = StreamState::Ready;
+                        Ok(Async::NotReady)
+                    }
+                    _ => return Err(Error::new(ErrorKind::Other,
+                                               "expected RelayCommand::Data or End")),
+                }
+            }
+            StreamState::Ready => {
+                stream.state = StreamState::Dead;
+                Ok(Async::Ready(stream.buffer.split_off(0)))
+            }
+            StreamState::Dead => {
+                Err(Error::new(ErrorKind::Other, "polled a dead stream?"))
+            }
+        };
+        self.streams.insert(stream_id, stream);
+        result
+    }
     fn send_cell_bytes(
         &mut self,
         bytes: Vec<u8>,
@@ -1010,6 +1182,7 @@ enum StreamState {
     Dead,
 }
 
+#[derive(PartialEq)]
 enum StreamFlavor {
     Dir,
     Data,

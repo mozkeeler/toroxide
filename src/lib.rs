@@ -149,6 +149,9 @@ where
     write_buffer: Vec<u8>,
     /// Map of ids to currently-open `Stream`s.
     streams: HashMap<u16, Stream>,
+    /// After reading a RELAY_DATA cell, check this value. If it is 0, send a RELAY_SENDME cell and
+    /// reset this to 100. Decrement it for each RELAY_DATA cell read.
+    sendme_indicator: u8,
 }
 
 impl<T, V> Circuit<T, V>
@@ -181,6 +184,7 @@ where
             buffer: Cursor::new(Vec::new()),
             write_buffer: Vec::new(),
             streams: HashMap::new(),
+            sendme_indicator: 100,
         }
     }
 
@@ -845,6 +849,7 @@ where
             flavor: StreamFlavor::Dir,
             destination: String::new(),
             buffer: Vec::new(),
+            sendme_indicator: 50,
         };
         self.streams.insert(stream_id, stream);
         stream_id
@@ -950,6 +955,31 @@ where
             println!("{}", relay_cell);
             match relay_cell.relay_command {
                 types::RelayCommand::Data => {
+                    // We have to send a SENDME on the *stream* every 50 RELAY_DATA cells and a
+                    // SENDME on the *circuit* every 100.
+                    if self.sendme_indicator == 0 {
+                        let data = Vec::new();
+                        let bytes = self.encrypt_cell_bytes(types::RelayCommand::SendMe, &data, 0);
+                        // so this isn't that easy probably - we'll need to loop if this write
+                        // blocks...
+                        println!("sending circuit SENDME");
+                        let async = self.send_cell_bytes(bytes)?;
+                        println!("result: {:?}", async);
+                        self.sendme_indicator = 100;
+                    }
+                    self.sendme_indicator -= 1;
+                    if stream.sendme_indicator == 0 {
+                        let data = Vec::new();
+                        let bytes = self.encrypt_cell_bytes(types::RelayCommand::SendMe, &data,
+                                                            stream_id);
+                        // so this isn't that easy probably - we'll need to loop if this write
+                        // blocks...
+                        println!("sending stream SENDME");
+                        let async = self.send_cell_bytes(bytes)?;
+                        println!("result: {:?}", async);
+                        stream.sendme_indicator = 50;
+                    }
+                    stream.sendme_indicator -= 1;
                     Ok(Async::Ready(relay_cell.get_data().to_owned()))
                 }
                 types::RelayCommand::End => {
@@ -973,6 +1003,7 @@ where
             flavor: StreamFlavor::Data,
             destination: destination.to_owned(),
             buffer: Vec::new(),
+            sendme_indicator: 50,
         };
         self.streams.insert(stream_id, stream);
         stream_id
@@ -1081,6 +1112,7 @@ struct Stream {
     flavor: StreamFlavor,
     destination: String,
     buffer: Vec<u8>,
+    sendme_indicator: u8,
 }
 
 struct TlsHashWrapper<T: TlsImpl + Read + Write> {

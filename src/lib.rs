@@ -802,46 +802,6 @@ where
         }
     }
 
-    /*
-    // returns what stream id we picked
-    /// begin_command must be types::RelayCommand::RELAY_BEGIN or
-    /// types::RelayCommand::RELAY_BEGIN_DIR for this to be useful
-    fn begin_common(
-        &mut self,
-        begin_command: types::RelayCommand,
-        begin_bytes: &[u8],
-    ) -> Result<u16, ()> {
-        let stream_id = self.used_stream_ids.get_new_id();
-        let bytes = self.encrypt_cell_bytes(begin_command, begin_bytes, stream_id);
-        self.send_cell_bytes(bytes)?;
-        let cell = self.read_cell()?;
-        println!("{:?}", cell);
-        if cell.command != types::Command::Relay {
-            return Err(());
-        }
-        let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
-        println!("{}", relay_cell);
-        if relay_cell.relay_command != types::RelayCommand::Connected {
-            return Err(());
-        }
-        Ok(stream_id)
-    }
-    */
-
-    /*
-    pub fn begin(&mut self, addrport: &str) -> Result<u16, ()> {
-        let begin = types::BeginCell::new(addrport);
-        println!("{:?}", begin);
-        // Hmmm maybe I wouldn't have to do all this "make a cell then make a vec then write_to it"
-        // if I defined a trait...?
-        let mut begin_bytes: Vec<u8> = Vec::new();
-        if begin.write_to(&mut begin_bytes).is_err() {
-            return Err(());
-        }
-        self.begin_common(types::RelayCommand::Begin, &begin_bytes)
-    }
-    */
-
     pub fn open_dir_stream(&mut self) -> u16 {
         let stream_id = self.used_stream_ids.get_new_id();
         let stream = Stream {
@@ -873,6 +833,7 @@ where
                         types::RelayCommand::BeginDir
                     }
                     StreamFlavor::Data => {
+                        println!("opening Data straem to '{}'", stream.destination);
                         let begin = types::BeginCell::new(&stream.destination);
                         if begin.write_to(&mut stream.buffer).is_err() {
                             return Err(Error::new(ErrorKind::Other,
@@ -1050,46 +1011,6 @@ where
             }
         }
     }
-
-    /*
-    pub fn recv(&mut self) -> Result<Vec<u8>, ()> {
-        let mut buf = Vec::new();
-        let cell = self.read_cell()?;
-        println!("{:?}", cell);
-        if cell.command != types::Command::Relay {
-            return Err(());
-        }
-        let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
-        println!("{}", relay_cell);
-        match relay_cell.relay_command {
-            types::RelayCommand::Data => buf.extend(relay_cell.get_data()),
-            types::RelayCommand::End => {}
-            _ => return Err(()),
-        }
-        Ok(buf)
-    }
-    */
-
-    /*
-    pub fn recv_to_end(&mut self) -> Result<Vec<u8>, ()> {
-        let mut buf = Vec::new();
-        loop {
-            let cell = self.read_cell()?;
-            println!("{:?}", cell);
-            if cell.command != types::Command::Relay {
-                return Err(());
-            }
-            let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
-            println!("{}", relay_cell);
-            match relay_cell.relay_command {
-                types::RelayCommand::Data => buf.extend(relay_cell.get_data()),
-                types::RelayCommand::End => break,
-                _ => return Err(()),
-            }
-        }
-        Ok(buf)
-    }
-    */
 }
 
 #[derive(Debug, PartialEq)]

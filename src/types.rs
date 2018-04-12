@@ -897,13 +897,15 @@ impl Extend2Cell {
 // This is really just a placeholder.
 #[derive(Debug)]
 pub enum BeginFlags {
-    None,
+    // By default we only set bit 1, indicating IPv6 OK. This is currently the least restrictive
+    // bitset.
+    Default,
 }
 
 impl BeginFlags {
     fn as_u32(&self) -> u32 {
         match self {
-            &BeginFlags::None => 0,
+            &BeginFlags::Default=> 1,
         }
     }
 }
@@ -918,7 +920,7 @@ impl BeginCell {
     pub fn new(addrport: &str) -> BeginCell {
         BeginCell {
             addrport: addrport.to_string(),
-            flags: BeginFlags::None,
+            flags: BeginFlags::Default,
         }
     }
 

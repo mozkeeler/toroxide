@@ -152,6 +152,8 @@ where
     /// After reading a RELAY_DATA cell, check this value. If it is 0, send a RELAY_SENDME cell and
     /// reset this to 100. Decrement it for each RELAY_DATA cell read.
     sendme_indicator: u8,
+    /// Buffered relay cells for streams that have yet to poll.
+    buffered_relay_cells: Vec<types::RelayCell>,
 }
 
 impl<T, V> Circuit<T, V>
@@ -185,6 +187,7 @@ where
             write_buffer: Vec::new(),
             streams: HashMap::new(),
             sendme_indicator: 100,
+            buffered_relay_cells: Vec::new(),
         }
     }
 
@@ -708,14 +711,35 @@ where
         }
     }
 
-    /*
-    fn read_cell(&mut self) -> Result<types::Cell, ()> {
-        match types::Cell::read_new(&mut self.tls_connection) {
-            Ok(cell) => Ok(cell),
-            Err(_) => Err(()),
+    fn poll_read_relay_cell(&mut self, stream_id: u16) -> Result<Async<types::RelayCell>, Error> {
+        let mut found = false;
+        let mut index = 0;
+        for candidate in &self.buffered_relay_cells {
+            if candidate.stream_id == stream_id {
+                found = true;
+                break;
+            }
+            index += 1;
         }
+        if found {
+           return Ok(Async::Ready(self.buffered_relay_cells.remove(index)));
+        }
+
+        let cell = match self.poll_read_cell()? {
+            Async::Ready(cell) => cell,
+            Async::NotReady => return Ok(Async::NotReady),
+        };
+        println!("{:?}", cell);
+        if cell.command != types::Command::Relay {
+            return Err(Error::new(ErrorKind::Other, "expected Command::Relay"));
+        }
+        let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
+        if relay_cell.stream_id == stream_id {
+            return Ok(Async::Ready(relay_cell));
+        }
+        self.buffered_relay_cells.push(relay_cell);
+        Ok(Async::NotReady)
     }
-    */
 
     // TODO: validate that there are no open streams when this happens.
     pub fn poll_extend(&mut self, node: &dir::TorPeer) -> Result<Async<()>, Error> {
@@ -757,15 +781,10 @@ where
                 }
             }
             CircuitState::Extended2Reading => {
-                let cell = match self.poll_read_cell()? {
+                let relay_cell = match self.poll_read_relay_cell(0)? {
                     Async::Ready(cell) => cell,
                     Async::NotReady => return Ok(Async::NotReady),
                 };
-                println!("{:?}", cell);
-                if cell.command != types::Command::Relay {
-                    return Err(Error::new(ErrorKind::Other, "expected Command::Relay"));
-                }
-                let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
                 println!("{}", relay_cell);
                 if relay_cell.relay_command != types::RelayCommand::Extended2 {
                     return Err(Error::new(ErrorKind::Other, "expected RelayCommand::Extended2"));
@@ -859,12 +878,7 @@ where
                 }
             }
             StreamState::ReadingBegan => {
-                if let Async::Ready(cell) = self.poll_read_cell()? {
-                    println!("{:?}", cell);
-                    if cell.command != types::Command::Relay {
-                        return Err(Error::new(ErrorKind::Other, "unexpected cell type"));
-                    }
-                    let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
+                if let Async::Ready(relay_cell) = self.poll_read_relay_cell(stream_id)? {
                     println!("{}", relay_cell);
                     if relay_cell.relay_command != types::RelayCommand::Connected {
                         return Err(Error::new(ErrorKind::Other, "expected RelayCommand::Connected"));
@@ -907,12 +921,8 @@ where
         if stream.state != StreamState::Ready {
             return Err(Error::new(ErrorKind::Other, "poll_stream_write: invalid stream state"));
         }
-        let result = if let Async::Ready(cell) = self.poll_read_cell()? {
-            println!("{:?}", cell);
-            if cell.command != types::Command::Relay {
-                return Err(Error::new(ErrorKind::Other, "poll_stream_read: expected RELAY cell"));
-            }
-            let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
+
+        let result = if let Async::Ready(relay_cell) = self.poll_read_relay_cell(stream_id)? {
             println!("{}", relay_cell);
             match relay_cell.relay_command {
                 types::RelayCommand::Data => {
@@ -997,6 +1007,7 @@ where
         }
     }
 
+    // TODO: check circ_id on received cells...?
     fn poll_read_cell(&mut self) -> Result<Async<types::Cell>, Error> {
         match self.read_to_buffer()? {
             Async::Ready(()) => {}

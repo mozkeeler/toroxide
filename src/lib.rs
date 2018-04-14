@@ -852,7 +852,7 @@ where
                         types::RelayCommand::BeginDir
                     }
                     StreamFlavor::Data => {
-                        println!("opening Data straem to '{}'", stream.destination);
+                        println!("opening Data stream to '{}'", stream.destination);
                         let begin = types::BeginCell::new(&stream.destination);
                         if begin.write_to(&mut stream.buffer).is_err() {
                             return Err(Error::new(ErrorKind::Other,

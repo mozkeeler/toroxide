@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::io::{Error, ErrorKind};
 
 use util;
 
@@ -107,14 +108,14 @@ impl PreTorPeer {
     }
 
     // TODO: make an error type for this Result (or just use Error)
-    pub fn to_tor_peer(&self, microdescriptor: &str) -> Result<TorPeer, ()> {
+    pub fn to_tor_peer(&self, microdescriptor: &str) -> Result<TorPeer, Error> {
         // This is how we authenticate the returned data. The microdescriptor hash was part of the
         // signed consensus document, so if the hash of the data we get back matches that hash, then
         // the data is what went into the consensus, in theory.
         let hashed = Sha256::digest(microdescriptor.as_bytes());
         let hashed_encoded = base64::encode_config(&hashed, base64::STANDARD_NO_PAD);
         if hashed_encoded != self.mdesc_hash {
-            return Err(());
+            return Err(Error::new(ErrorKind::Other, "microdescriptor hash mismatch"));
         }
 
         let mut ntor_onion_key: [u8; 32] = [0; 32];

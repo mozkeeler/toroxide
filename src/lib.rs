@@ -302,7 +302,6 @@ where
                 ))
             }
         };
-        println!("negotiated version {}", version);
         self.state = CircuitState::CertsReading;
         Ok(Async::Ready(()))
     }
@@ -383,7 +382,6 @@ where
                 ))
             }
         };
-        println!("{:?}", auth_challenge);
         if !auth_challenge.has_auth_type(types::AuthType::Ed25519Sha256Rfc5705) {
             return Err(Error::new(ErrorKind::InvalidInput, "unsupported auth type"));
         }
@@ -544,7 +542,6 @@ where
                 return Ok(Async::NotReady);
             }
         };
-        println!("{:?}", cell);
         if cell.command != types::Command::Netinfo {
             return Err(Error::new(ErrorKind::Other, "unexpected cell type"));
         }
@@ -552,7 +549,6 @@ where
             Ok(netinfo_cell) => netinfo_cell,
             Err(_) => return Err(Error::new(ErrorKind::Other, "couldn't decode NETINFO cell")),
         };
-        println!("{:?}", netinfo);
         self.other_or_address = Some(netinfo.get_other_or_address());
         self.state = CircuitState::NetinfoWriting;
         Ok(Async::Ready(()))
@@ -633,7 +629,6 @@ where
                 return Ok(Async::NotReady);
             }
         };
-        println!("{:?}", cell);
         // TODO: handle DESTROY differently here?
         if cell.command != types::Command::CreatedFast {
             return Err(Error::new(ErrorKind::InvalidInput, "unexpected cell type"));
@@ -647,7 +642,6 @@ where
                 ))
             }
         };
-        println!("{:?}", created_fast);
         let circuit_keys = match tor_kdf(&self.x, created_fast.get_y(), created_fast.get_kh()) {
             Ok(circuit_keys) => circuit_keys,
             Err(_) => return Err(Error::new(ErrorKind::Other, "Tor KDF failed")),
@@ -729,9 +723,9 @@ where
             Async::Ready(cell) => cell,
             Async::NotReady => return Ok(Async::NotReady),
         };
-        println!("{:?}", cell);
         if cell.command != types::Command::Relay {
-            return Err(Error::new(ErrorKind::Other, "expected Command::Relay"));
+            let msg = format!("expected Command::Relay, got {:?}", cell.command);
+            return Err(Error::new(ErrorKind::Other, msg));
         }
         let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
         if relay_cell.stream_id == stream_id {
@@ -785,7 +779,6 @@ where
                     Async::Ready(cell) => cell,
                     Async::NotReady => return Ok(Async::NotReady),
                 };
-                println!("{}", relay_cell);
                 if relay_cell.relay_command != types::RelayCommand::Extended2 {
                     return Err(Error::new(ErrorKind::Other, "expected RelayCommand::Extended2"));
                 }
@@ -852,7 +845,6 @@ where
                         types::RelayCommand::BeginDir
                     }
                     StreamFlavor::Data => {
-                        println!("opening Data stream to '{}'", stream.destination);
                         let begin = types::BeginCell::new(&stream.destination);
                         if begin.write_to(&mut stream.buffer).is_err() {
                             return Err(Error::new(ErrorKind::Other,
@@ -879,7 +871,6 @@ where
             }
             StreamState::ReadingBegan => {
                 if let Async::Ready(relay_cell) = self.poll_read_relay_cell(stream_id)? {
-                    println!("{}", relay_cell);
                     if relay_cell.relay_command != types::RelayCommand::Connected {
                         return Err(Error::new(ErrorKind::Other, "expected RelayCommand::Connected"));
                     }
@@ -933,9 +924,7 @@ where
                         let bytes = self.encrypt_cell_bytes(types::RelayCommand::SendMe, &data, 0);
                         // so this isn't that easy probably - we'll need to loop if this write
                         // blocks...
-                        println!("sending circuit SENDME");
                         let async = self.send_cell_bytes(bytes)?;
-                        println!("result: {:?}", async);
                         self.sendme_indicator = 100;
                     }
                     self.sendme_indicator -= 1;
@@ -945,9 +934,7 @@ where
                                                             stream_id);
                         // so this isn't that easy probably - we'll need to loop if this write
                         // blocks...
-                        println!("sending stream SENDME");
                         let async = self.send_cell_bytes(bytes)?;
-                        println!("result: {:?}", async);
                         stream.sendme_indicator = 50;
                     }
                     stream.sendme_indicator -= 1;
@@ -957,8 +944,11 @@ where
                     stream.state = StreamState::Dead;
                     Ok(Async::Ready(Vec::new()))
                 }
+                types::RelayCommand::SendMe => {
+                    Ok(Async::NotReady)
+                }
                 _ => return Err(Error::new(ErrorKind::Other,
-                                           "expected RelayCommand::Data or End")),
+                                           "expected RelayCommand::Data, End, or SendMe")),
             }
         } else {
             Ok(Async::NotReady)
@@ -1359,11 +1349,9 @@ fn ntor_handshake(
     client_X: [u8; 32],
     mut client_x: [u8; 32],
 ) -> Result<CircuitKeys, ()> {
-    println!("{:?}", created2_cell);
     // technically we should check the corresponding create2_cell type here
     let server_handshake =
         types::NtorServerHandshake::read_new(&mut &created2_cell.h_data[..]).unwrap();
-    println!("{:?}", server_handshake);
     client_x[0] &= 248;
     client_x[31] &= 127;
     client_x[31] |= 64;

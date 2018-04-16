@@ -660,15 +660,14 @@ impl RelayCell {
 
 impl fmt::Display for RelayCell {
     fn fmt(&self, dest: &mut fmt::Formatter) -> fmt::Result {
+        if self.recognized != 0 {
+            return write!(dest, "RelayCell {{ {:?} (not recognized - bug?) }}", self.relay_command);
+        }
         write!(
             dest,
-            "RelayCell {{ {:?} {} {} {} {} ",
-            self.relay_command, self.recognized, self.stream_id, self.digest, self.length
-        )?;
-        for b in &self.data {
-            write!(dest, "{:02x}", b)?;
-        }
-        write!(dest, " }}")
+            "RelayCell {{ {:?} stream_id: {} length: {}, }}",
+            self.relay_command, self.stream_id, self.length
+        )
     }
 }
 

@@ -95,7 +95,8 @@ impl PreTorPeer {
             is_exit: flags.find(|s| s == &"Exit").is_some(),
             is_guard: flags.find(|s| s == &"Guard").is_some(),
             is_usable: flags.find(|s| s == &"Running").is_some()
-                && flags.find(|s| s == &"Valid").is_some(),
+                && flags.find(|s| s == &"Valid").is_some()
+                && flags.find(|s| s== &"Authority").is_none(),
         }
     }
 

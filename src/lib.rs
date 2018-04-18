@@ -31,7 +31,7 @@ use std::hash::Hash;
 use std::io::{Cursor, Error, ErrorKind, Seek, SeekFrom};
 use std::io::prelude::*;
 use std::ops::Mul;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub trait TlsImpl {
     fn get_peer_cert_hash(&self) -> Result<[u8; 32], Error>;
@@ -780,7 +780,8 @@ where
                     Async::NotReady => return Ok(Async::NotReady),
                 };
                 if relay_cell.relay_command != types::RelayCommand::Extended2 {
-                    return Err(Error::new(ErrorKind::Other, "expected RelayCommand::Extended2"));
+                    return Err(unexpected_relay_command_error(relay_cell.relay_command,
+                                                              types::RelayCommand::Extended2));
                 }
                 // The contents of an EXTENDED2 relay cell is the same as a CREATED2 cell
                 let extended2 = match types::Created2Cell::read_new(&mut relay_cell.get_data()) {
@@ -822,6 +823,7 @@ where
             destination: String::new(),
             buffer: Vec::new(),
             sendme_indicator: 50,
+            last_cell_sent: Instant::now(),
         };
         self.streams.insert(stream_id, stream);
         stream_id
@@ -872,7 +874,8 @@ where
             StreamState::ReadingBegan => {
                 if let Async::Ready(relay_cell) = self.poll_read_relay_cell(stream_id)? {
                     if relay_cell.relay_command != types::RelayCommand::Connected {
-                        return Err(Error::new(ErrorKind::Other, "expected RelayCommand::Connected"));
+                        return Err(unexpected_relay_command_error(relay_cell.relay_command,
+                                                                  types::RelayCommand::Connected));
                     }
                     stream.state = StreamState::Ready;
                     stream.buffer.clear();
@@ -888,7 +891,7 @@ where
     }
 
     pub fn poll_stream_write(&mut self, stream_id: u16, data: &[u8]) -> Result<Async<()>, Error> {
-        let stream = match self.streams.remove(&stream_id) {
+        let mut stream = match self.streams.remove(&stream_id) {
             Some(stream) => stream,
             None => return Err(Error::new(ErrorKind::Other, "invalid stream_id")),
         };
@@ -900,6 +903,7 @@ where
         // Also this doesn't handle data.len() > 509, so that's another thing...
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, data, stream_id);
         let async = self.send_cell_bytes(bytes)?;
+        stream.last_cell_sent = Instant::now();
         self.streams.insert(stream_id, stream);
         Ok(async)
     }
@@ -951,6 +955,15 @@ where
                                            "expected RelayCommand::Data, End, or SendMe")),
             }
         } else {
+            let now = Instant::now();
+            if now.duration_since(stream.last_cell_sent) > Duration::from_millis(5000) {
+                println!("sending Drop padding cell");
+                let bytes = self.encrypt_cell_bytes(types::RelayCommand::Drop, &[], stream_id);
+                let async = self.send_cell_bytes(bytes)?;
+                // hmmm we kind-of have to drop the async here? (we really need to re-work this in
+                // case we ever have to buffer data when sending...)
+                stream.last_cell_sent = now;
+            }
             Ok(Async::NotReady)
         };
         self.streams.insert(stream_id, stream);
@@ -965,6 +978,7 @@ where
             destination: destination.to_owned(),
             buffer: Vec::new(),
             sendme_indicator: 50,
+            last_cell_sent: Instant::now(),
         };
         self.streams.insert(stream_id, stream);
         stream_id
@@ -1014,6 +1028,13 @@ where
     }
 }
 
+fn unexpected_relay_command_error(
+    actual: types::RelayCommand,
+    expected: types::RelayCommand
+) -> Error {
+    Error::new(ErrorKind::Other, format!("expected {:?}, got {:?}", expected, actual))
+}
+
 #[derive(Debug, PartialEq)]
 enum StreamState {
     New,
@@ -1035,6 +1056,7 @@ struct Stream {
     destination: String,
     buffer: Vec<u8>,
     sendme_indicator: u8,
+    last_cell_sent: Instant,
 }
 
 struct TlsHashWrapper<T: TlsImpl + Read + Write> {

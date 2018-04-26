@@ -152,6 +152,8 @@ where
     /// After reading a RELAY_DATA cell, check this value. If it is 0, send a RELAY_SENDME cell and
     /// reset this to 100. Decrement it for each RELAY_DATA cell read.
     sendme_indicator: u8,
+    /// If this goes to 0, we can't send more RELAY_DATA cells until we receive a RELAY_SENDME.
+    send_window: u16,
     /// Buffered relay cells for streams that have yet to poll.
     buffered_relay_cells: Vec<types::RelayCell>,
 }
@@ -187,6 +189,7 @@ where
             write_buffer: Vec::new(),
             streams: HashMap::new(),
             sendme_indicator: 100,
+            send_window: 1000,
             buffered_relay_cells: Vec::new(),
         }
     }
@@ -728,6 +731,10 @@ where
             return Err(Error::new(ErrorKind::Other, msg));
         }
         let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
+        if relay_cell.relay_command == types::RelayCommand::SendMe &&
+            relay_cell.stream_id == 0 {
+            self.send_window += 100;
+        }
         if relay_cell.stream_id == stream_id {
             return Ok(Async::Ready(relay_cell));
         }
@@ -823,6 +830,7 @@ where
             destination: String::new(),
             buffer: Vec::new(),
             sendme_indicator: 50,
+            send_window: 500,
             last_cell_sent: Instant::now(),
         };
         self.streams.insert(stream_id, stream);
@@ -836,7 +844,6 @@ where
         };
         let result = match stream.state {
             StreamState::New => {
-                stream.state = StreamState::WritingBegin;
                 let command = match stream.flavor {
                     StreamFlavor::Dir => {
                         let begin = types::BeginDirCell::new();
@@ -855,18 +862,14 @@ where
                         types::RelayCommand::Begin
                     }
                 };
-                let mut bytes = self.encrypt_cell_bytes(command, &stream.buffer, stream_id);
-                stream.buffer.clear();
-                stream.buffer.append(&mut bytes);
-                Ok(Async::NotReady)
-            }
-            StreamState::WritingBegin => {
-                match self.send_cell_bytes(stream.buffer.clone())? {
+                let bytes = self.encrypt_cell_bytes(command, &stream.buffer, stream_id);
+                match self.send_cell_bytes(bytes)? {
                     Async::Ready(()) => {
                         stream.state = StreamState::ReadingBegan;
                         Ok(Async::NotReady)
                     }
                     Async::NotReady => {
+                        panic!("we had to buffer sending bytes :(");
                         Ok(Async::NotReady)
                     }
                 }
@@ -874,6 +877,7 @@ where
             StreamState::ReadingBegan => {
                 if let Async::Ready(relay_cell) = self.poll_read_relay_cell(stream_id)? {
                     if relay_cell.relay_command != types::RelayCommand::Connected {
+                        println!("{}", relay_cell);
                         return Err(unexpected_relay_command_error(relay_cell.relay_command,
                                                                   types::RelayCommand::Connected));
                     }
@@ -901,8 +905,13 @@ where
         // It's unclear how to do this correctly. If we actually do have to poll here, we don't want
         // to re-encrypt the same bytes and try to send them...
         // Also this doesn't handle data.len() > 509, so that's another thing...
+        if self.send_window == 0 {
+            println!("uh-oh: circuit send window is 0. things will probably start failing");
+        }
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, data, stream_id);
         let async = self.send_cell_bytes(bytes)?;
+        self.send_window -= 1;
+        stream.send_window -= 1;
         stream.last_cell_sent = Instant::now();
         self.streams.insert(stream_id, stream);
         Ok(async)
@@ -918,7 +927,6 @@ where
         }
 
         let result = if let Async::Ready(relay_cell) = self.poll_read_relay_cell(stream_id)? {
-            println!("{}", relay_cell);
             match relay_cell.relay_command {
                 types::RelayCommand::Data => {
                     // We have to send a SENDME on the *stream* every 50 RELAY_DATA cells and a
@@ -949,6 +957,7 @@ where
                     Ok(Async::Ready(Vec::new()))
                 }
                 types::RelayCommand::SendMe => {
+                    stream.send_window += 50;
                     Ok(Async::NotReady)
                 }
                 _ => return Err(Error::new(ErrorKind::Other,
@@ -978,6 +987,7 @@ where
             destination: destination.to_owned(),
             buffer: Vec::new(),
             sendme_indicator: 50,
+            send_window: 500,
             last_cell_sent: Instant::now(),
         };
         self.streams.insert(stream_id, stream);
@@ -1004,7 +1014,7 @@ where
                 Ok(Async::Ready(()))
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                println!("this is probably a bug - we need to buffer a write");
+                panic!("this is probably a bug - we need to buffer a write");
                 Ok(Async::NotReady)
             }
             Err(e) => Err(e),
@@ -1038,7 +1048,7 @@ fn unexpected_relay_command_error(
 #[derive(Debug, PartialEq)]
 enum StreamState {
     New,
-    WritingBegin,
+    //WritingBegin,
     ReadingBegan,
     Ready,
     Dead,
@@ -1056,6 +1066,7 @@ struct Stream {
     destination: String,
     buffer: Vec<u8>,
     sendme_indicator: u8,
+    send_window: u16,
     last_cell_sent: Instant,
 }
 

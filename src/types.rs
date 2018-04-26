@@ -665,9 +665,13 @@ impl fmt::Display for RelayCell {
         }
         write!(
             dest,
-            "RelayCell {{ {:?} stream_id: {} length: {}, }}",
+            "RelayCell {{ {:?} stream_id: {} length: {}, ",
             self.relay_command, self.stream_id, self.length
-        )
+        )?;
+        if self.relay_command == RelayCommand::End {
+            write!(dest, "(END: {})", self.data[0])?;
+        }
+        write!(dest, "}}")
     }
 }
 

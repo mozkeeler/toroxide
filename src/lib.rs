@@ -708,7 +708,7 @@ where
         }
     }
 
-    fn poll_read_relay_cell(&mut self, stream_id: u16) -> Result<Async<types::RelayCell>, Error> {
+    fn get_buffered_relay_cell(&mut self, stream_id: u16) -> Option<types::RelayCell> {
         let mut found = false;
         let mut index = 0;
         for candidate in &self.buffered_relay_cells {
@@ -719,30 +719,51 @@ where
             index += 1;
         }
         if found {
-           return Ok(Async::Ready(self.buffered_relay_cells.remove(index)));
+           Some(self.buffered_relay_cells.remove(index))
+        } else {
+            None
         }
+    }
 
+    fn poll_read_relay_cell(&mut self) -> Result<Async<()>, Error> {
         let cell = match self.poll_read_cell()? {
             Async::Ready(cell) => cell,
-            Async::NotReady => return Ok(Async::NotReady),
+            Async::NotReady => {
+                if self.buffered_relay_cells.len() > 0 {
+                    return Ok(Async::Ready(()));
+                }
+                return Ok(Async::NotReady);
+            }
         };
+        if cell.command == types::Command::Destroy {
+            println!("got circuit destroy cell: {:?}", cell);
+            self.state = CircuitState::Error;
+            return Err(Error::new(ErrorKind::Other, "circuit destroyed"));
+        }
         if cell.command != types::Command::Relay {
             let msg = format!("expected Command::Relay, got {:?}", cell.command);
             return Err(Error::new(ErrorKind::Other, msg));
         }
         let relay_cell = self.decrypt_cell_bytes(&cell.payload)?;
-        if relay_cell.relay_command == types::RelayCommand::SendMe &&
-            relay_cell.stream_id == 0 {
-            self.send_window += 100;
-        }
-        if relay_cell.stream_id == stream_id {
-            return Ok(Async::Ready(relay_cell));
+        if relay_cell.relay_command == types::RelayCommand::SendMe {
+            if relay_cell.stream_id == 0 {
+                self.send_window += 100;
+            } else if let Some(stream) = self.streams.get_mut(&relay_cell.stream_id) {
+                stream.send_window += 50;
+            } else {
+                let msg = format!("unexpected stream id {}", relay_cell.stream_id);
+                return Err(Error::new(ErrorKind::Other, msg));
+            }
         }
         self.buffered_relay_cells.push(relay_cell);
-        Ok(Async::NotReady)
+        Ok(Async::Ready(()))
     }
 
-    // TODO: validate that there are no open streams when this happens.
+    // We want to make sure there aren't live streams when we're extending, because we don't
+    // actually keep track of how many hops each stream was created with, so we will get the
+    // encryption/decryption wrong. Unfortunately currently we open directory streams to do the
+    // extending, so this doesn't really work... (I guess we need to make sure they're really dead
+    // before continuing?)
     pub fn poll_extend(&mut self, node: &dir::TorPeer) -> Result<Async<()>, Error> {
         match self.state {
             CircuitState::Ready => {
@@ -782,9 +803,13 @@ where
                 }
             }
             CircuitState::Extended2Reading => {
-                let relay_cell = match self.poll_read_relay_cell(0)? {
-                    Async::Ready(cell) => cell,
+                match self.poll_read_relay_cell()? {
+                    Async::Ready(()) => {},
                     Async::NotReady => return Ok(Async::NotReady),
+                }
+                let relay_cell = match self.get_buffered_relay_cell(0) {
+                    Some(cell) => cell,
+                    None => return Ok(Async::NotReady),
                 };
                 if relay_cell.relay_command != types::RelayCommand::Extended2 {
                     return Err(unexpected_relay_command_error(relay_cell.relay_command,
@@ -838,6 +863,7 @@ where
     }
 
     pub fn poll_stream_setup(&mut self, stream_id: u16) -> Result<Async<()>, Error> {
+        let _ = self.poll_read_relay_cell()?;
         let mut stream = match self.streams.remove(&stream_id) {
             Some(stream) => stream,
             None => return Err(Error::new(ErrorKind::Other, "invalid stream_id")),
@@ -875,7 +901,7 @@ where
                 }
             }
             StreamState::ReadingBegan => {
-                if let Async::Ready(relay_cell) = self.poll_read_relay_cell(stream_id)? {
+                if let Some(relay_cell) = self.get_buffered_relay_cell(stream_id) {
                     if relay_cell.relay_command != types::RelayCommand::Connected {
                         println!("{}", relay_cell);
                         return Err(unexpected_relay_command_error(relay_cell.relay_command,
@@ -895,18 +921,17 @@ where
     }
 
     pub fn poll_stream_write(&mut self, stream_id: u16, data: &[u8]) -> Result<Async<()>, Error> {
+        let _ = self.poll_read_relay_cell()?;
         let mut stream = match self.streams.remove(&stream_id) {
             Some(stream) => stream,
             None => return Err(Error::new(ErrorKind::Other, "invalid stream_id")),
         };
         if stream.state != StreamState::Ready {
-            return Err(Error::new(ErrorKind::Other, "poll_stream_write: invalid stream state"));
+            let msg = format!("poll_stream_write: invalid stream state: {:?}", stream.state);
+            return Err(Error::new(ErrorKind::Other, msg));
         }
-        // It's unclear how to do this correctly. If we actually do have to poll here, we don't want
-        // to re-encrypt the same bytes and try to send them...
-        // Also this doesn't handle data.len() > 509, so that's another thing...
-        if self.send_window == 0 {
-            println!("uh-oh: circuit send window is 0. things will probably start failing");
+        if self.send_window == 0 || stream.send_window == 0 {
+            return Ok(Async::NotReady);
         }
         let bytes = self.encrypt_cell_bytes(types::RelayCommand::Data, data, stream_id);
         let async = self.send_cell_bytes(bytes)?;
@@ -918,15 +943,20 @@ where
     }
 
     pub fn poll_stream_read(&mut self, stream_id: u16) -> Result<Async<Vec<u8>>, Error> {
+        match self.poll_read_relay_cell()? {
+            Async::Ready(()) => {},
+            Async::NotReady => return Ok(Async::NotReady),
+        }
         let mut stream = match self.streams.remove(&stream_id) {
             Some(stream) => stream,
             None => return Err(Error::new(ErrorKind::Other, "invalid stream_id")),
         };
         if stream.state != StreamState::Ready {
-            return Err(Error::new(ErrorKind::Other, "poll_stream_write: invalid stream state"));
+            let msg = format!("poll_stream_write: invalid stream state: {:?}", stream.state);
+            return Err(Error::new(ErrorKind::Other, msg));
         }
 
-        let result = if let Async::Ready(relay_cell) = self.poll_read_relay_cell(stream_id)? {
+        let result = if let Some(relay_cell) = self.get_buffered_relay_cell(stream_id) {
             match relay_cell.relay_command {
                 types::RelayCommand::Data => {
                     // We have to send a SENDME on the *stream* every 50 RELAY_DATA cells and a
@@ -1128,17 +1158,16 @@ impl<T: TlsImpl + Read + Write> Write for TlsHashWrapper<T> {
 }
 
 struct AesContext {
-    aes: blockmodes::CtrMode<aessafe::AesSafe128Encryptor>,
+    aes: blockmodes::CtrModeX8<aessafe::AesSafe128EncryptorX8>,
 }
 
 impl AesContext {
     fn new(key: &[u8]) -> AesContext {
-        let mut iv: Vec<u8> = Vec::with_capacity(16);
-        iv.resize(16, 0);
+        let iv: [u8; 16] = [0; 16];
         let key: [u8; 16] = slice_to_16_byte_array(key);
-        let aes_dec = aessafe::AesSafe128Encryptor::new(&key);
+        let aes_dec = aessafe::AesSafe128EncryptorX8::new(&key);
         AesContext {
-            aes: blockmodes::CtrMode::new(aes_dec, iv),
+            aes: blockmodes::CtrModeX8::new(aes_dec, &iv),
         }
     }
 }
